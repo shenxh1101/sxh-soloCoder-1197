@@ -17,8 +17,10 @@ class EncryptionInfo:
 @dataclass
 class Segment:
     index: int
+    true_index: int
     url: str
     duration: float = 0.0
+    start_time: float = 0.0
     encryption: EncryptionInfo = field(default_factory=EncryptionInfo)
     byte_size: Optional[int] = None
 
@@ -29,6 +31,77 @@ class M3U8Playlist:
     segments: List[Segment] = field(default_factory=list)
     is_encrypted: bool = False
     duration: float = 0.0
+    media_sequence: int = 0
+
+    def slice_by_time(self, start_sec: Optional[float] = None,
+                      end_sec: Optional[float] = None) -> "M3U8Playlist":
+        if start_sec is None:
+            start_sec = 0.0
+        if end_sec is None:
+            end_sec = self.duration
+
+        start_sec = max(0.0, float(start_sec))
+        end_sec = min(self.duration, float(end_sec))
+
+        if start_sec >= end_sec:
+            raise ValueError(
+                f"无效时间范围: start={start_sec}s, end={end_sec}s "
+                f"(总时长={self.duration}s)"
+            )
+
+        new_segments: List[Segment] = []
+        new_duration = 0.0
+        new_local_idx = 0
+        new_is_encrypted = False
+
+        for seg in self.segments:
+            seg_end = seg.start_time + seg.duration
+            overlaps = seg_end > start_sec and seg.start_time < end_sec
+            if overlaps:
+                new_seg = Segment(
+                    index=new_local_idx,
+                    true_index=seg.true_index,
+                    url=seg.url,
+                    duration=seg.duration,
+                    start_time=new_duration,
+                    encryption=EncryptionInfo(
+                        method=seg.encryption.method,
+                        key_url=seg.encryption.key_url,
+                        iv=seg.encryption.iv
+                    ),
+                    byte_size=seg.byte_size
+                )
+                if new_seg.encryption.method != "NONE":
+                    new_is_encrypted = True
+                new_segments.append(new_seg)
+                new_duration += seg.duration
+                new_local_idx += 1
+
+        if not new_segments:
+            raise ValueError(
+                f"时间范围 [{start_sec}s, {end_sec}s] 内没有分片"
+            )
+
+        new_playlist = M3U8Playlist(
+            url=self.url,
+            segments=new_segments,
+            is_encrypted=new_is_encrypted,
+            duration=new_duration,
+            media_sequence=self.media_sequence
+        )
+        return new_playlist
+
+    def describe_time_slice(self, start_sec: Optional[float],
+                            end_sec: Optional[float]) -> str:
+        if start_sec is None:
+            start_sec = 0.0
+        if end_sec is None:
+            end_sec = self.duration
+        from .utils import format_time
+        return (
+            f"截取范围: {format_time(start_sec)} - {format_time(end_sec)} "
+            f"(总时长 {format_time(self.duration)})"
+        )
 
 
 @dataclass
@@ -64,6 +137,25 @@ def format_quality_table(entries: List[MasterPlaylistEntry]) -> str:
         lines.append(f"{e.index:<6}{res_str:<14}{bw_str:<14}{codec_str:<14}")
     lines.append("-" * 70)
     return "\n".join(lines)
+
+
+def parse_time_str(s: str) -> float:
+    s = s.strip()
+    if not s:
+        raise ValueError("空的时间字符串")
+
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 2:
+            m, sec = parts
+            return int(m) * 60 + float(sec)
+        elif len(parts) == 3:
+            h, m, sec = parts
+            return int(h) * 3600 + int(m) * 60 + float(sec)
+        else:
+            raise ValueError(f"无法解析时间格式: {s}")
+    else:
+        return float(s)
 
 
 class M3U8Parser:
@@ -141,13 +233,20 @@ class M3U8Parser:
 
         current_encryption = EncryptionInfo()
         current_duration = 0.0
+        current_time = 0.0
         segment_index = 0
 
         i = 0
         while i < len(lines):
             line = lines[i].strip()
 
-            if line.startswith("#EXT-X-KEY:"):
+            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                try:
+                    playlist.media_sequence = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    playlist.media_sequence = 0
+
+            elif line.startswith("#EXT-X-KEY:"):
                 attrs = self._parse_attributes(line.split(":", 1)[1])
                 method = attrs.get("METHOD", "NONE")
                 key_uri = attrs.get("URI")
@@ -170,14 +269,16 @@ class M3U8Parser:
                     current_duration = float(duration_str)
                 except ValueError:
                     current_duration = 0.0
-                playlist.duration += current_duration
 
             elif line and not line.startswith("#"):
                 segment_url = resolve_url(self.base_url, line)
+                true_index = playlist.media_sequence + segment_index
                 segment = Segment(
                     index=segment_index,
+                    true_index=true_index,
                     url=segment_url,
                     duration=current_duration,
+                    start_time=current_time,
                     encryption=EncryptionInfo(
                         method=current_encryption.method,
                         key_url=current_encryption.key_url,
@@ -185,6 +286,8 @@ class M3U8Parser:
                     )
                 )
                 playlist.segments.append(segment)
+                playlist.duration += current_duration
+                current_time += current_duration
                 segment_index += 1
 
             elif line.startswith("#EXT-X-ENDLIST"):

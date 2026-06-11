@@ -3,10 +3,21 @@ import os
 import sys
 from typing import List, Optional, Tuple
 
-from .parser import M3U8Parser, format_quality_table, MasterPlaylistEntry
+from .parser import (
+    M3U8Parser,
+    format_quality_table,
+    MasterPlaylistEntry,
+    parse_time_str
+)
 from .downloader import M3U8Downloader, DownloadResult
 from .merger import FFmpegMerger, cleanup_temp_dir
-from .task_recorder import TaskRecorder, TASK_STATUS_SUCCESS
+from .task_recorder import (
+    TaskRecorder,
+    TASK_STATUS_SUCCESS,
+    TASK_STATUS_PENDING,
+    TASK_STATUS_RUNNING,
+    TASK_STATUS_FAILED
+)
 from .utils import (
     get_temp_dir,
     sanitize_filename,
@@ -126,7 +137,9 @@ def download_single(
     target_resolution: Optional[str] = None,
     target_bandwidth_mbps: Optional[float] = None,
     list_qualities_only: bool = False,
-    task_recorder: Optional[TaskRecorder] = None
+    task_recorder: Optional[TaskRecorder] = None,
+    start_sec: Optional[float] = None,
+    end_sec: Optional[float] = None
 ) -> Tuple[bool, str]:
     proxies = parse_proxy(proxy)
 
@@ -172,12 +185,24 @@ def download_single(
         quality_label_for_log = selected_entry.quality_label
         selected_quality_idx = selected_entry.index
 
+    if start_sec is not None or end_sec is not None:
+        try:
+            print(playlist.describe_time_slice(start_sec, end_sec))
+            playlist = playlist.slice_by_time(start_sec, end_sec)
+            print(f"截取后共 {len(playlist.segments)} 个分片，时长 {format_time(playlist.duration)}")
+        except ValueError as e:
+            msg = f"时间范围截取失败: {e}"
+            print(msg)
+            if task_recorder:
+                task_recorder.mark_failed(url, msg)
+            return False, msg
+
     total_segments = len(playlist.segments)
     print(f"找到 {total_segments} 个分片")
     if playlist.duration > 0:
         print(f"总时长: {format_time(playlist.duration)}")
     if playlist.is_encrypted:
-        print(f"检测到加密: AES-128")
+        print(f"检测到加密: AES-128 (起始序号: {playlist.media_sequence})")
 
     if _check_existing_output(output_file, resume):
         if task_recorder:
@@ -295,7 +320,7 @@ def download_single(
 
 
 def download_batch(
-    url_list_file: str,
+    url_list_file: Optional[str] = None,
     output_dir: str = ".",
     output_format: str = "mp4",
     concurrency: int = 5,
@@ -308,18 +333,39 @@ def download_batch(
     target_resolution: Optional[str] = None,
     target_bandwidth_mbps: Optional[float] = None,
     task_log_file: Optional[str] = None,
-    skip_completed: bool = True
+    skip_completed: bool = True,
+    continue_task_log: Optional[str] = None,
+    export_report: bool = False,
+    report_format: str = "txt",
+    start_sec: Optional[float] = None,
+    end_sec: Optional[float] = None
 ) -> None:
-    urls = read_url_list(url_list_file)
-    if not urls:
-        print("URL列表为空")
-        return
+    if continue_task_log:
+        if not os.path.exists(continue_task_log):
+            print(f"错误: 任务记录文件不存在: {continue_task_log}")
+            sys.exit(1)
+        task_log_file = continue_task_log
+        recorder = TaskRecorder(task_log_file)
+        urls = recorder.get_retry_urls()
+        if not urls:
+            print("没有需要继续处理的任务（所有任务均已成功）")
+            print(recorder.format_summary())
+            return
+        print(f"继续未完成任务: 从 {task_log_file} 读取")
+        print(f"待处理任务数: {len(urls)}")
+    else:
+        if not url_list_file:
+            print("错误: 请指定 URL 列表文件 (-f) 或使用 --continue")
+            sys.exit(1)
+        urls = read_url_list(url_list_file)
+        if not urls:
+            print("URL列表为空")
+            return
+        if not task_log_file:
+            base = os.path.splitext(os.path.basename(url_list_file))[0]
+            task_log_file = os.path.join(output_dir, f"{base}_tasks.json")
+        recorder = TaskRecorder(task_log_file)
 
-    if not task_log_file:
-        base = os.path.splitext(os.path.basename(url_list_file))[0]
-        task_log_file = os.path.join(output_dir, f"{base}_tasks.json")
-
-    recorder = TaskRecorder(task_log_file)
     print(f"任务记录文件: {task_log_file}")
     print(recorder.format_summary())
     print()
@@ -339,6 +385,7 @@ def download_batch(
             task = recorder.get_task(url)
             out = task.output_file if task else "(未知)"
             print(f"跳过: 之前已成功完成 -> {out}")
+            recorder.mark_skipped(url, reason="previously_completed")
             skip_count += 1
             print("-" * 60)
             continue
@@ -358,7 +405,9 @@ def download_batch(
                 target_resolution=target_resolution,
                 target_bandwidth_mbps=target_bandwidth_mbps,
                 list_qualities_only=False,
-                task_recorder=recorder
+                task_recorder=recorder,
+                start_sec=start_sec,
+                end_sec=end_sec
             )
             if ok:
                 success_count += 1
@@ -396,10 +445,15 @@ def download_batch(
             if t.error_message:
                 print(f"    原因: {t.error_message[:100]}")
 
+    if export_report or continue_task_log or fail_count > 0:
+        report_file = recorder.export_report(format=report_format)
+        if report_file:
+            print(f"\n✓ 汇总报告已导出: {report_file}")
+
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="M3U8 视频下载与合并工具 (改进版)",
+        description="M3U8 视频下载与合并工具 (增强版)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 === 常用示例 ===
@@ -419,14 +473,20 @@ def create_parser() -> argparse.ArgumentParser:
 5. 指定目标码率 (Mbps):
    %(prog)s -u https://example.com/video.m3u8 --bandwidth 2.0
 
-6. 批量下载 (自动记录状态，断点续跑自动跳过成功项):
+6. 下载指定时间范围 (从第10分钟到第25分钟):
+   %(prog)s -u https://example.com/video.m3u8 --start 10:00 --end 25:00
+
+7. 批量下载 (自动记录状态，断点续跑自动跳过成功项):
    %(prog)s -f urls.txt -d downloads/ -c 10
 
-7. 使用代理:
+8. 继续未完成的批量任务:
+   %(prog)s --continue downloads/urls_tasks.json
+
+9. 使用代理:
    %(prog)s -u https://example.com/video.m3u8 --proxy http://127.0.0.1:8080
 
-8. 输出 MKV 格式并保留临时文件:
-   %(prog)s -u https://example.com/video.m3u8 --format mkv --keep-temp
+10. 输出 MKV 格式并保留临时文件:
+    %(prog)s -u https://example.com/video.m3u8 --format mkv --keep-temp
         """
     )
 
@@ -515,6 +575,18 @@ def create_parser() -> argparse.ArgumentParser:
         help="按目标码率选择 (单位 Mbps，会选最接近的)"
     )
 
+    time_group = parser.add_argument_group("时间范围截取")
+    time_group.add_argument(
+        "--start",
+        default=None,
+        help="起始时间 (支持 HH:MM:SS / MM:SS / 秒数)，例如 10:00 表示第10分钟"
+    )
+    time_group.add_argument(
+        "--end",
+        default=None,
+        help="结束时间 (支持 HH:MM:SS / MM:SS / 秒数)，例如 25:00 表示第25分钟"
+    )
+
     batch_group = parser.add_argument_group("批量下载")
     batch_group.add_argument(
         "--task-log",
@@ -526,11 +598,29 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="批量下载时不跳过已成功记录的任务 (强制重新下载)"
     )
+    batch_group.add_argument(
+        "--continue",
+        dest="continue_task",
+        default=None,
+        metavar="TASK_LOG",
+        help="继续未完成的任务，从指定的任务记录 JSON 读取失败/待处理的 URL，跳过成功项"
+    )
+    batch_group.add_argument(
+        "--export-report",
+        action="store_true",
+        help="批量任务结束后导出汇总报告 (有失败任务时默认导出)"
+    )
+    batch_group.add_argument(
+        "--report-format",
+        choices=["txt", "json"],
+        default="txt",
+        help="汇总报告格式: txt 或 json (默认: txt)"
+    )
 
     parser.add_argument(
         "--version",
         action="version",
-        version="m3u8-downloader 2.0.0 (improved)"
+        version="m3u8-downloader 3.0.0 (enhanced)"
     )
 
     return parser
@@ -542,9 +632,21 @@ def main() -> None:
 
     url = args.url or args.url_arg
 
-    if not url and not args.file:
+    start_sec = None
+    end_sec = None
+    try:
+        if args.start:
+            start_sec = parse_time_str(args.start)
+        if args.end:
+            end_sec = parse_time_str(args.end)
+    except ValueError as e:
+        print(f"时间格式错误: {e}")
+        print("支持格式: HH:MM:SS, MM:SS, 或纯秒数")
+        sys.exit(1)
+
+    if not url and not args.file and not args.continue_task:
         parser.print_help()
-        print("\n错误: 请指定 m3u8 URL (位置参数/-u) 或 URL 列表文件 (-f)")
+        print("\n错误: 请指定 m3u8 URL (位置参数/-u) 或 URL 列表文件 (-f) 或 --continue")
         sys.exit(1)
 
     output_format = args.format.lower()
@@ -554,7 +656,7 @@ def main() -> None:
 
     skip_completed = not args.no_skip_completed
 
-    if args.file:
+    if args.file or args.continue_task:
         download_batch(
             url_list_file=args.file,
             output_dir=output_dir,
@@ -569,7 +671,12 @@ def main() -> None:
             target_resolution=args.resolution,
             target_bandwidth_mbps=args.bandwidth,
             task_log_file=args.task_log,
-            skip_completed=skip_completed
+            skip_completed=skip_completed,
+            continue_task_log=args.continue_task,
+            export_report=args.export_report,
+            report_format=args.report_format,
+            start_sec=start_sec,
+            end_sec=end_sec
         )
     else:
         if args.list_qualities:
@@ -597,7 +704,9 @@ def main() -> None:
             target_resolution=args.resolution,
             target_bandwidth_mbps=args.bandwidth,
             list_qualities_only=False,
-            task_recorder=None
+            task_recorder=None,
+            start_sec=start_sec,
+            end_sec=end_sec
         )
         if ok:
             print(f"\n✓ 任务完成: {msg}")

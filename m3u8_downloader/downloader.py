@@ -2,13 +2,12 @@ import os
 import sys
 import time
 import threading
-from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Callable, Dict, Set
 import requests
 
 from .parser import M3U8Playlist, Segment
-from .decryptor import KeyManager, SegmentDecryptor
+from .decryptor import KeyManager
 from .utils import (
     get_ts_filename,
     get_decrypted_ts_filename,
@@ -71,6 +70,7 @@ class DownloadProgress:
         self.total_bytes = estimated_total_bytes
         self.downloaded_bytes = 0
         self.in_progress_bytes = 0
+        self.estimated_bytes_per_segment = 0.0
         self.start_time = time.time()
         self.last_update_time = time.time()
         self.last_bytes = 0
@@ -90,6 +90,10 @@ class DownloadProgress:
         with self._lock:
             self.completed_segments += 1
             self.downloaded_bytes += size_bytes
+            if self.completed_segments > 0:
+                self.estimated_bytes_per_segment = (
+                    self.downloaded_bytes / self.completed_segments
+                )
 
     def set_total_bytes(self, total: int):
         with self._lock:
@@ -99,7 +103,7 @@ class DownloadProgress:
         with self._lock:
             now = time.time()
             elapsed = now - self.last_update_time
-            if elapsed > 0.2:
+            if elapsed > 0.15:
                 bytes_diff = self.downloaded_bytes - self.last_bytes
                 self.current_speed = bytes_diff / elapsed if elapsed > 0 else 0
                 self.last_bytes = self.downloaded_bytes
@@ -110,10 +114,41 @@ class DownloadProgress:
         return self.downloaded_bytes + self.in_progress_bytes
 
     @property
+    def estimated_remaining_bytes(self) -> int:
+        with self._lock:
+            remaining_segments = self.total_segments - self.completed_segments
+            if self.estimated_bytes_per_segment > 0:
+                return max(0, int(remaining_segments * self.estimated_bytes_per_segment))
+            if self.total_bytes > 0:
+                return max(0, self.total_bytes - self.downloaded_bytes)
+            return 0
+
+    @property
+    def estimated_total(self) -> int:
+        with self._lock:
+            if self.total_bytes > 0:
+                return self.total_bytes
+            if self.estimated_bytes_per_segment > 0:
+                return int(self.total_segments * self.estimated_bytes_per_segment)
+            return max(self.downloaded_bytes + self.in_progress_bytes, 1)
+
+    @property
     def percentage(self) -> float:
-        if self.total_segments == 0:
-            return 100.0
-        return (self.completed_segments / self.total_segments) * 100
+        total = self.estimated_total
+        if total <= 0:
+            if self.total_segments == 0:
+                return 100.0
+            return (self.completed_segments / self.total_segments) * 100
+        display = self.total_display_bytes
+        if display >= total:
+            if self.total_segments > 0:
+                return min(99.9, (self.completed_segments / self.total_segments) * 100)
+            return 99.9
+        byte_pct = (display / total) * 100
+        if self.total_segments > 0:
+            seg_pct = (self.completed_segments / self.total_segments) * 100
+            return max(byte_pct, seg_pct * 0.3)
+        return byte_pct
 
     @property
     def elapsed_time(self) -> float:
@@ -121,13 +156,14 @@ class DownloadProgress:
 
     @property
     def eta(self) -> Optional[float]:
+        if self.current_speed > 0:
+            remaining = self.estimated_remaining_bytes
+            if remaining > 0:
+                return remaining / self.current_speed
         if self.total_segments > 0 and self.completed_segments > 0:
             remaining_segments = self.total_segments - self.completed_segments
             time_per_segment = self.elapsed_time / self.completed_segments
             return remaining_segments * time_per_segment
-        if self.current_speed > 0 and self.total_bytes > 0:
-            remaining = max(0, self.total_bytes - self.downloaded_bytes)
-            return remaining / self.current_speed if self.current_speed > 0 else None
         return None
 
     def stop(self):
@@ -156,7 +192,12 @@ class ProgressBar:
 
         display_bytes = progress.total_display_bytes
         if display_bytes > 0:
-            status += f"  已下载: {format_size(display_bytes)}"
+            total_est = progress.estimated_total
+            if total_est > 0:
+                status += (f"  {format_size(display_bytes)}"
+                           f"/{format_size(total_est)}")
+            else:
+                status += f"  已下载: {format_size(display_bytes)}"
 
         sys.stdout.write(status)
         sys.stdout.flush()
@@ -225,7 +266,6 @@ class M3U8Downloader:
         filename = get_ts_filename(segment.index)
         filepath = os.path.join(self.output_dir, filename)
         temp_filepath = filepath + ".part"
-        downloaded_this_call = 0
 
         if self.resume and os.path.exists(filepath):
             size = os.path.getsize(filepath)
@@ -233,7 +273,10 @@ class M3U8Downloader:
                 return True, size, "already_downloaded"
 
         last_error = ""
+        total_progress_reported = 0
+
         for attempt in range(self.retries):
+            attempt_bytes = 0
             try:
                 response = requests.get(
                     segment.url,
@@ -247,33 +290,36 @@ class M3U8Downloader:
                 content_length = response.headers.get("Content-Length")
                 expected_size = int(content_length) if content_length else 0
 
-                bytes_downloaded = 0
                 with open(temp_filepath, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
                             chunk_len = len(chunk)
-                            bytes_downloaded += chunk_len
-                            downloaded_this_call += chunk_len
+                            attempt_bytes += chunk_len
                             if self._progress:
                                 self._progress.add_in_progress(chunk_len)
 
-                if expected_size > 0 and bytes_downloaded < expected_size * 0.9:
+                if expected_size > 0 and attempt_bytes < expected_size * 0.9:
                     raise ValueError(
-                        f"不完整下载: {bytes_downloaded}/{expected_size} bytes"
+                        f"不完整下载: {attempt_bytes}/{expected_size} bytes "
+                        f"(尝试 {attempt+1}/{self.retries})"
                     )
 
-                if bytes_downloaded == 0:
+                if attempt_bytes == 0:
                     raise ValueError("下载的文件为空")
 
                 if os.path.exists(filepath):
                     os.remove(filepath)
                 os.rename(temp_filepath, filepath)
 
-                return True, bytes_downloaded, ""
+                total_progress_reported += attempt_bytes
+                return True, attempt_bytes, ""
 
             except Exception as e:
                 last_error = str(e)
+                if attempt_bytes > 0 and self._progress:
+                    self._progress.remove_in_progress(attempt_bytes)
+                total_progress_reported = max(0, total_progress_reported - attempt_bytes)
                 if os.path.exists(temp_filepath):
                     try:
                         os.remove(temp_filepath)
@@ -304,7 +350,7 @@ class M3U8Downloader:
             return True, "already_decrypted"
 
         ok = decryptor.decrypt_segment_file(
-            input_file, output_file, segment.index, segment.encryption.iv
+            input_file, output_file, segment.true_index, segment.encryption.iv
         )
         if not ok:
             return False, "解密处理失败"
@@ -358,19 +404,20 @@ class M3U8Downloader:
                 segment = future_to_segment[future]
                 try:
                     ok, size, note = future.result()
-                    if self._progress:
-                        self._progress.remove_in_progress(size)
                     if ok:
+                        if note == "already_downloaded":
+                            if self._progress:
+                                self._progress.add_completed(size)
                         self.result.success_segments.add(segment.index)
                         self.result.total_bytes += size
-                        if self._progress:
-                            self._progress.add_completed(size)
                     else:
                         self.result.failed_segments[segment.index] = note or "未知错误"
                         download_errors += 1
                         if download_errors >= 20:
                             self.result.cancelled = True
-                            self.result.error_message = f"下载失败过多 ({download_errors})，中止任务"
+                            self.result.error_message = (
+                                f"下载失败过多 ({download_errors})，中止任务"
+                            )
                             break
                 except Exception as e:
                     self.result.failed_segments[segment.index] = str(e)
@@ -396,7 +443,6 @@ class M3U8Downloader:
                     decrypt_total += 1
 
             if decrypt_total > 0:
-                decrypt_success = 0
                 for i, segment in enumerate(segments, 1):
                     if segment.encryption.method != "NONE":
                         ok, err = self._decrypt_segment(segment)
@@ -405,7 +451,6 @@ class M3U8Downloader:
                         )
                         sys.stdout.flush()
                         if ok:
-                            decrypt_success += 1
                             self.result.decrypted_segments.add(segment.index)
                         else:
                             self.result.decrypt_failed[segment.index] = err
@@ -420,4 +465,4 @@ class M3U8Downloader:
     def _progress_monitor(self):
         while self._progress and self._progress._running:
             self._progress_bar.render(self._progress)
-            time.sleep(0.15)
+            time.sleep(0.1)

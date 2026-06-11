@@ -208,3 +208,149 @@ class TaskRecorder:
     def list_pending(self) -> List[TaskRecord]:
         return [t for t in self.tasks.values()
                 if t.status == TASK_STATUS_PENDING]
+
+    def list_success(self) -> List[TaskRecord]:
+        return [t for t in self.tasks.values()
+                if t.status == TASK_STATUS_SUCCESS]
+
+    def list_skipped(self) -> List[TaskRecord]:
+        return [t for t in self.tasks.values()
+                if t.status == TASK_STATUS_SKIPPED]
+
+    def get_retry_urls(self) -> List[str]:
+        urls = []
+        for task in self.tasks.values():
+            if task.status in (TASK_STATUS_FAILED,
+                               TASK_STATUS_PENDING,
+                               TASK_STATUS_RUNNING):
+                urls.append(task.url)
+        return urls
+
+    def mark_skipped(self, url: str, reason: str = "already_completed"):
+        task = self.get_or_create(url)
+        task.status = TASK_STATUS_SKIPPED
+        if not task.error_message:
+            task.error_message = reason
+        self.save()
+
+    def export_report(self, report_file: Optional[str] = None,
+                       format: str = "txt") -> Optional[str]:
+        from .utils import format_size, format_time
+
+        if not report_file:
+            base, _ = os.path.splitext(self.log_file)
+            report_file = f"{base}_report.{format}"
+
+        success_list = self.list_success()
+        failed_list = self.list_failed()
+        skipped_list = self.list_skipped()
+        pending_list = self.list_pending()
+
+        try:
+            if format.lower() == "json":
+                report_data = {
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
+                    "statistics": self.get_statistics(),
+                    "success": [t.to_dict() for t in success_list],
+                    "failed": [t.to_dict() for t in failed_list],
+                    "skipped": [t.to_dict() for t in skipped_list],
+                    "pending": [t.to_dict() for t in pending_list],
+                }
+                with open(report_file, 'w', encoding='utf-8') as f:
+                    json.dump(report_data, f, ensure_ascii=False, indent=2)
+            else:
+                lines = []
+                lines.append("=" * 70)
+                lines.append("M3U8 批量下载汇总报告")
+                lines.append(f"生成时间: {datetime.now().isoformat(timespec='seconds')}")
+                lines.append(f"任务日志: {self.log_file}")
+                lines.append("=" * 70)
+                lines.append("")
+                lines.append("【统计】")
+                stats = self.get_statistics()
+                lines.append(f"  总数:   {stats['total']}")
+                lines.append(f"  成功:   {stats[TASK_STATUS_SUCCESS]}")
+                lines.append(f"  失败:   {stats[TASK_STATUS_FAILED]}")
+                lines.append(f"  跳过:   {stats[TASK_STATUS_SKIPPED]}")
+                lines.append(f"  待处理: {stats[TASK_STATUS_PENDING]}")
+                lines.append(f"  运行中: {stats[TASK_STATUS_RUNNING]}")
+                lines.append("")
+
+                total_bytes = sum(t.downloaded_bytes for t in success_list)
+                total_duration = sum(t.duration_seconds for t in success_list)
+                if total_bytes > 0 or total_duration > 0:
+                    lines.append("【累计】")
+                    lines.append(f"  成功任务总下载量: {format_size(total_bytes)}")
+                    lines.append(f"  成功任务总耗时:   {format_time(total_duration)}")
+                    lines.append("")
+
+                if success_list:
+                    lines.append("=" * 70)
+                    lines.append(f"【成功任务】 ({len(success_list)} 个)")
+                    lines.append("-" * 70)
+                    for t in success_list:
+                        lines.append(f"  URL: {t.url}")
+                        if t.output_file:
+                            lines.append(f"  输出: {t.output_file}")
+                        size_info = []
+                        if t.downloaded_bytes > 0:
+                            size_info.append(format_size(t.downloaded_bytes))
+                        if t.duration_seconds > 0:
+                            size_info.append(format_time(t.duration_seconds))
+                        if t.quality_label:
+                            size_info.append(t.quality_label)
+                        if size_info:
+                            lines.append(f"  信息: {' | '.join(size_info)}")
+                        lines.append("")
+
+                if failed_list:
+                    lines.append("=" * 70)
+                    lines.append(f"【失败任务】 ({len(failed_list)} 个)")
+                    lines.append("-" * 70)
+                    for t in failed_list:
+                        lines.append(f"  URL: {t.url}")
+                        if t.error_message:
+                            lines.append(f"  原因: {t.error_message}")
+                        if t.failed_segments:
+                            preview = t.failed_segments[:10]
+                            extra = "" if len(t.failed_segments) <= 10 else (
+                                f"... (共{len(t.failed_segments)}个)"
+                            )
+                            lines.append(f"  下载失败分片: {preview}{extra}")
+                        if t.decrypt_failed:
+                            preview = t.decrypt_failed[:10]
+                            extra = "" if len(t.decrypt_failed) <= 10 else (
+                                f"... (共{len(t.decrypt_failed)}个)"
+                            )
+                            lines.append(f"  解密失败分片: {preview}{extra}")
+                        lines.append("")
+
+                if skipped_list:
+                    lines.append("=" * 70)
+                    lines.append(f"【跳过任务】 ({len(skipped_list)} 个)")
+                    lines.append("-" * 70)
+                    for t in skipped_list:
+                        lines.append(f"  URL: {t.url}")
+                        if t.output_file:
+                            lines.append(f"  已有输出: {t.output_file}")
+                        lines.append("")
+
+                if pending_list:
+                    lines.append("=" * 70)
+                    lines.append(f"【待处理任务】 ({len(pending_list)} 个)")
+                    lines.append("-" * 70)
+                    for t in pending_list:
+                        lines.append(f"  URL: {t.url}")
+                    lines.append("")
+
+                lines.append("=" * 70)
+                lines.append("报告结束")
+                lines.append("=" * 70)
+
+                with open(report_file, 'w', encoding='utf-8') as f:
+                    f.write("\n".join(lines))
+
+            return report_file
+        except Exception as e:
+            print(f"导出报告失败: {e}")
+            return None
