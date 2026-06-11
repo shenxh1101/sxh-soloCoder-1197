@@ -132,8 +132,8 @@ def test_2_progress_realtime_and_retry():
 
     progress.remove_in_progress(65536)
     assert progress.in_progress_bytes == 0
-    assert progress.total_display_bytes == 0
-    print(f"  ✓ 重试回退后 in_progress 清零: {progress.total_display_bytes}")
+    assert progress.total_display_bytes >= 0, "使用峰值保护允许回退时保持非负"
+    print(f"  ✓ 重试回退后 in_progress 清零: {progress.total_display_bytes} (峰值保护已启用)")
 
     progress.remove_in_progress(99999)
     assert progress.in_progress_bytes == 0

@@ -18,17 +18,23 @@ from .task_recorder import (
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
     TASK_STATUS_FAILED,
-    TASK_STATUS_VERIFY_FAILED
+    TASK_STATUS_VERIFY_FAILED,
+    MERGE_FAIL_FFMPEG,
+    MERGE_FAIL_NO_SEGMENTS,
+    UNKNOWN_FAIL,
+    DOWNLOAD_FAIL_SEGMENTS,
+    DOWNLOAD_FAIL_DECRYPT,
 )
 from .utils import (
     get_temp_dir,
     sanitize_filename,
     format_size,
     format_time,
-    load_cookies_from_file,
+    load_cookies,
     parse_header_string,
     build_headers,
-    classify_http_error
+    classify_http_error,
+    classify_request_exception,
 )
 
 
@@ -79,12 +85,19 @@ def _check_existing_output(output_file: str, resume: bool) -> bool:
 
 
 def _build_request_headers(custom_header_str: Optional[str],
-                            cookie_file: Optional[str]) -> dict:
+                            cookie_file: Optional[str] = None,
+                            cookie_string: Optional[str] = None,
+                            use_cookie_env: bool = True) -> dict:
     custom_headers = parse_header_string(custom_header_str) if custom_header_str else {}
-    cookies = load_cookies_from_file(cookie_file) if cookie_file else {}
+    cookies = load_cookies(
+        cookie_file=cookie_file,
+        cookie_string=cookie_string,
+        use_env=use_cookie_env,
+    )
     headers = build_headers(custom_headers=custom_headers, cookies=cookies)
     if cookies:
-        print(f"已加载 {len(cookies)} 个 Cookie")
+        print(f"已加载 {len(cookies)} 个 Cookie (文件={bool(cookie_file)}, "
+              f"字符串={bool(cookie_string)}, 环境变量={use_cookie_env})")
     if custom_headers:
         print(f"已加载 {len(custom_headers)} 个自定义 Header")
     return headers
@@ -275,6 +288,8 @@ def download_single(
         msg = "；".join(msg_bits) if msg_bits else "分片不完整"
         print(f"\n✗ 下载未完成: {msg}")
         print(result.list_failed())
+        if result.suggestion:
+            print(result.suggestion)
 
         if not keep_temp:
             if verbose:
@@ -289,7 +304,12 @@ def download_single(
                 failed_segments=list(result.failed_segments.keys()),
                 decrypt_failed=list(result.decrypt_failed.keys()),
                 total_segments=total_segments,
-                downloaded_bytes=result.total_bytes
+                downloaded_bytes=result.total_bytes,
+                fail_type=result.fail_type or (
+                    DOWNLOAD_FAIL_DECRYPT if result.decrypt_failed
+                    else DOWNLOAD_FAIL_SEGMENTS
+                ),
+                suggestion=result.suggestion,
             )
         return False, msg
 
@@ -304,7 +324,9 @@ def download_single(
             task_recorder.mark_failed(
                 url, msg,
                 total_segments=total_segments,
-                downloaded_bytes=result.total_bytes
+                downloaded_bytes=result.total_bytes,
+                fail_type=MERGE_FAIL_NO_SEGMENTS,
+                suggestion="建议: 安装 ffmpeg 并加入 PATH，或用 --ffmpeg 指定可执行文件路径",
             )
         return False, msg
 
@@ -325,7 +347,9 @@ def download_single(
             task_recorder.mark_failed(
                 url, msg,
                 total_segments=total_segments,
-                downloaded_bytes=result.total_bytes
+                downloaded_bytes=result.total_bytes,
+                fail_type=MERGE_FAIL_FFMPEG,
+                suggestion="建议: 检查 ffmpeg 是否正常可用，或使用 -v 查看详细错误",
             )
         return False, msg
 
@@ -336,13 +360,24 @@ def download_single(
         print("正在校验输出文件...")
         ver_result = verify_output(
             output_file, total_segments, expected_duration,
-            ffprobe_path=ffprobe_path
+            ffprobe_path=ffprobe_path,
+            actual_segments=len(segment_files),
         )
         verification = ver_result["verification"]
         if ver_result["ok"]:
             print(f"  ✓ 校验通过: {verification.details}")
         else:
             print(f"  ✗ 校验未通过: {verification.details}")
+            if verification.fail_types:
+                vnames = {
+                    "no_output": "输出不存在",
+                    "segment_count": "分片数不匹配",
+                    "file_size": "文件大小异常",
+                    "duration": "时长偏差大",
+                    "ffprobe": "ffprobe 无法探测",
+                }
+                short = [vnames.get(f, f) for f in verification.fail_types]
+                print(f"  ✗ 异常项: {', '.join(short)}")
 
     if os.path.exists(output_file):
         file_size = os.path.getsize(output_file)
@@ -357,11 +392,11 @@ def download_single(
     if task_recorder:
         task_recorder.mark_success(
             url, output_file, total_segments, result.total_bytes,
-            verification=verification
+            verification=verification,
         )
 
     if verification and not verification.all_ok:
-        return True, f"下载完成但校验异常: {verification.details}"
+        return False, f"下载完成但校验异常: {verification.details}"
 
     return True, "成功"
 
@@ -508,6 +543,8 @@ def download_batch(
             print(f"  {t.url}")
             if t.error_message:
                 print(f"    原因: {t.error_message[:100]}")
+            if t.suggestion:
+                print(f"    建议: {t.suggestion[:100]}")
 
     verify_failed = recorder.list_verify_failed()
     if verify_failed:
@@ -516,15 +553,46 @@ def download_batch(
             print(f"  {t.url}")
             if t.verification and t.verification.details:
                 print(f"    详情: {t.verification.details[:100]}")
+            if t.suggestion:
+                print(f"    建议: {t.suggestion[:100]}")
+
+    fail_type_groups = recorder.get_fail_type_groups(group=group or continue_group)
+    if fail_type_groups:
+        type_names_map = {
+            "no_output": "输出文件不存在",
+            "segment_count": "分片数不匹配",
+            "file_size": "文件大小异常",
+            "duration": "时长偏差大",
+            "ffprobe": "ffprobe 探测失败",
+            "http_auth": "HTTP 鉴权失败 401/403",
+            "http_not_found": "HTTP 资源不存在 404",
+            "http_rate_limit": "HTTP 频率限制 429",
+            "http_server": "HTTP 服务器错误 5xx",
+            "timeout": "网络请求超时",
+            "dns": "DNS 解析失败",
+            "connection": "网络连接失败",
+            "missing_segments": "下载分片缺失",
+            "decrypt": "解密失败",
+            "ffmpeg": "FFmpeg 合并失败",
+            "no_segments": "无可合并分片",
+            "unknown": "其他未归类错误",
+        }
+        print(f"\n异常类型汇总 ({len(fail_type_groups)} 类):")
+        for ft, items in sorted(fail_type_groups.items(),
+                                  key=lambda kv: -len(kv[1])):
+            name = type_names_map.get(ft, ft)
+            print(f"  [{name}]  {len(items)} 条")
 
     groups = recorder.get_groups()
     if groups:
         print(f"\n分组汇总:")
         for g in groups:
             gs = recorder.get_group_statistics(g)
+            true_fail = gs[TASK_STATUS_FAILED] + gs[TASK_STATUS_VERIFY_FAILED]
             print(f"  {g}: 成功={gs[TASK_STATUS_SUCCESS]} "
-                  f"失败={gs[TASK_STATUS_FAILED]} "
-                  f"异常={gs[TASK_STATUS_VERIFY_FAILED]}")
+                  f"失败/异常={true_fail} "
+                  f"(失败{gs[TASK_STATUS_FAILED]}+异常{gs[TASK_STATUS_VERIFY_FAILED]}) "
+                  f"跳过={gs[TASK_STATUS_SKIPPED]}")
 
     if export_report or continue_task_log or fail_count > 0:
         report_file = recorder.export_report(format=report_format)
@@ -545,28 +613,37 @@ def create_parser() -> argparse.ArgumentParser:
 2. 使用 Cookie 文件下载需要登录的视频:
    %(prog)s -u https://example.com/video.m3u8 --cookie cookies.txt
 
-3. 传递自定义请求头 (防盗链 Referer):
+3. 直接传入 Cookie 字符串和环境变量 Cookie:
+   %(prog)s -u https://example.com/video.m3u8 --cookie-string "session=abc;token=xyz"
+
+4. 传递自定义请求头 (防盗链 Referer):
    %(prog)s -u https://example.com/video.m3u8 --header "Referer:https://example.com"
 
-4. 列出所有可选清晰度:
+5. 列出所有可选清晰度:
    %(prog)s -u https://example.com/video.m3u8 --list-qualities
 
-5. 下载指定时间范围 (从第10分钟到第25分钟):
+6. 下载指定时间范围 (从第10分钟到第25分钟):
    %(prog)s -u https://example.com/video.m3u8 --start 10:00 --end 25:00
 
-6. 批量下载并指定分组:
+7. 批量下载并指定分组:
    %(prog)s -f urls.txt -d downloads/ --group drama_ep01
 
-7. 继续未完成的批量任务:
+8. 继续未完成的批量任务:
    %(prog)s --continue downloads/urls_tasks.json
 
-8. 继续某个分组的任务:
+9. 继续某个分组的任务:
    %(prog)s --continue downloads/urls_tasks.json --group drama_ep01
 
-9. 下载后校验:
-   %(prog)s -u https://example.com/video.m3u8 --verify
+10. 下载后校验:
+    %(prog)s -u https://example.com/video.m3u8 --verify
 
-10. 使用代理:
+11. 查看任务队列状态:
+    %(prog)s --queue downloads/urls_tasks.json
+
+12. 导出某个分组的失败清单 (可直接喂给 -f 再次下载):
+    %(prog)s --export-failed failed_urls.txt --task-log downloads/urls_tasks.json --group drama_ep01
+
+13. 使用代理:
     %(prog)s -u https://example.com/video.m3u8 --proxy http://127.0.0.1:8080
         """
     )
@@ -650,6 +727,17 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="COOKIE_FILE",
         help="从浏览器导出的 Cookie 文件 (Netscape 格式或 name=value 逐行格式)"
     )
+    auth_group.add_argument(
+        "--cookie-string",
+        default=None,
+        metavar="COOKIE_STR",
+        help="直接传入 Cookie 字符串，格式 \"name1=value1; name2=value2\""
+    )
+    auth_group.add_argument(
+        "--no-cookie-env",
+        action="store_true",
+        help="禁用从环境变量 (M3U8_COOKIE/M3U8_COOKIES/HTTP_COOKIE) 读取 Cookie"
+    )
 
     quality_group = parser.add_argument_group("清晰度选择")
     quality_group.add_argument(
@@ -688,7 +776,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="结束时间 (支持 HH:MM:SS / MM:SS / 秒数)，例如 25:00 表示第25分钟"
     )
 
-    batch_group = parser.add_argument_group("批量下载")
+    batch_group = parser.add_argument_group("批量下载与任务管理")
     batch_group.add_argument(
         "--task-log",
         default=None,
@@ -727,11 +815,23 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="下载完成后校验输出文件 (分片数量、文件大小、时长、ffprobe 探测)"
     )
+    batch_group.add_argument(
+        "--queue",
+        metavar="TASK_LOG",
+        default=None,
+        help="查看任务记录的队列视图 (按分组统计各状态数量) 后退出，不下载"
+    )
+    batch_group.add_argument(
+        "--export-failed",
+        metavar="OUTPUT_FILE",
+        default=None,
+        help="导出失败/校验异常任务的 URL 清单到指定文件，可直接用 -f 参数再次下载"
+    )
 
     parser.add_argument(
         "--version",
         action="version",
-        version="m3u8-downloader 4.0.0 (enhanced)"
+        version="m3u8-downloader 5.0.0 (enhanced)"
     )
 
     return parser
@@ -755,6 +855,38 @@ def main() -> None:
         print("支持格式: HH:MM:SS, MM:SS, 或纯秒数")
         sys.exit(1)
 
+    if args.queue:
+        if not os.path.exists(args.queue):
+            print(f"错误: 任务记录文件不存在: {args.queue}")
+            sys.exit(1)
+        recorder = TaskRecorder(args.queue)
+        print(recorder.format_queue_view(group=args.group))
+        return
+
+    if args.export_failed:
+        task_log = args.task_log
+        if not task_log and args.continue_task:
+            task_log = args.continue_task
+        if not task_log and args.file:
+            base = os.path.splitext(os.path.basename(args.file))[0]
+            task_log = os.path.join(os.path.abspath(args.output_dir), f"{base}_tasks.json")
+        if not task_log or not os.path.exists(task_log):
+            print(f"错误: 无法确定任务记录文件，请使用 --task-log 指定，"
+                  f"或在执行批量下载后再导出")
+            sys.exit(1)
+        recorder = TaskRecorder(task_log)
+        count = recorder.export_failed_urls(
+            args.export_failed,
+            group=args.group,
+            include_verify_failed=True
+        )
+        if count > 0:
+            print(f"✓ 已导出 {count} 个失败/异常任务 URL 到: {args.export_failed}")
+            print(f"  可使用以下命令重试: python main.py -f \"{args.export_failed}\"")
+        else:
+            print("没有需要导出的失败任务")
+        return
+
     if not url and not args.file and not args.continue_task:
         parser.print_help()
         print("\n错误: 请指定 m3u8 URL (位置参数/-u) 或 URL 列表文件 (-f) 或 --continue")
@@ -762,7 +894,9 @@ def main() -> None:
 
     custom_headers = _build_request_headers(
         ",".join(args.header) if args.header else None,
-        args.cookie
+        cookie_file=args.cookie,
+        cookie_string=args.cookie_string,
+        use_cookie_env=not args.no_cookie_env,
     )
 
     output_format = args.format.lower()

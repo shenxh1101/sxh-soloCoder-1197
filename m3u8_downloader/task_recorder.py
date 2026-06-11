@@ -12,6 +12,24 @@ TASK_STATUS_FAILED = "failed"
 TASK_STATUS_SKIPPED = "skipped"
 TASK_STATUS_VERIFY_FAILED = "verify_failed"
 
+VERIFY_FAIL_SEGMENT_COUNT = "segment_count"
+VERIFY_FAIL_FILE_SIZE = "file_size"
+VERIFY_FAIL_DURATION = "duration"
+VERIFY_FAIL_FFPROBE = "ffprobe"
+VERIFY_FAIL_NO_OUTPUT = "no_output"
+DOWNLOAD_FAIL_HTTP_AUTH = "http_auth"
+DOWNLOAD_FAIL_HTTP_NOT_FOUND = "http_not_found"
+DOWNLOAD_FAIL_HTTP_RATE_LIMIT = "http_rate_limit"
+DOWNLOAD_FAIL_HTTP_SERVER = "http_server"
+DOWNLOAD_FAIL_TIMEOUT = "timeout"
+DOWNLOAD_FAIL_DNS = "dns"
+DOWNLOAD_FAIL_CONNECTION = "connection"
+DOWNLOAD_FAIL_SEGMENTS = "missing_segments"
+DOWNLOAD_FAIL_DECRYPT = "decrypt"
+MERGE_FAIL_FFMPEG = "ffmpeg"
+MERGE_FAIL_NO_SEGMENTS = "no_segments"
+UNKNOWN_FAIL = "unknown"
+
 
 @dataclass
 class VerificationResult:
@@ -19,12 +37,22 @@ class VerificationResult:
     file_size_ok: bool = True
     duration_ok: bool = True
     ffprobe_ok: bool = True
+    output_exists_ok: bool = True
     details: str = ""
+    fail_types: List[str] = field(default_factory=list)
+    expected_segments: int = 0
+    actual_segments: Optional[int] = None
+    expected_duration: float = 0.0
+    actual_duration: Optional[float] = None
+    expected_min_size: int = 0
+    actual_file_size: Optional[int] = None
+    ffprobe_streams: int = 0
 
     @property
     def all_ok(self) -> bool:
         return (self.segment_count_ok and self.file_size_ok
-                and self.duration_ok and self.ffprobe_ok)
+                and self.duration_ok and self.ffprobe_ok
+                and self.output_exists_ok)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -36,7 +64,17 @@ class VerificationResult:
             file_size_ok=data.get("file_size_ok", True),
             duration_ok=data.get("duration_ok", True),
             ffprobe_ok=data.get("ffprobe_ok", True),
+            output_exists_ok=data.get("output_exists_ok", True),
             details=data.get("details", ""),
+            fail_types=list(data.get("fail_types", [])),
+            expected_segments=data.get("expected_segments", 0),
+            actual_segments=data.get("actual_segments"),
+            expected_duration=float(data.get("expected_duration", 0.0)),
+            actual_duration=(float(data["actual_duration"])
+                             if data.get("actual_duration") is not None else None),
+            expected_min_size=data.get("expected_min_size", 0),
+            actual_file_size=data.get("actual_file_size"),
+            ffprobe_streams=data.get("ffprobe_streams", 0),
         )
 
 
@@ -60,6 +98,8 @@ class TaskRecord:
     group: Optional[str] = None
     output_dir: Optional[str] = None
     verification: Optional[VerificationResult] = None
+    fail_type: Optional[str] = None
+    suggestion: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -90,6 +130,8 @@ class TaskRecord:
             group=data.get("group"),
             output_dir=data.get("output_dir"),
             verification=verification,
+            fail_type=data.get("fail_type"),
+            suggestion=data.get("suggestion"),
         )
 
 
@@ -164,10 +206,21 @@ class TaskRecorder:
         task.output_file = output_file
         task.total_segments = total_segments
         task.downloaded_bytes = downloaded_bytes
-        task.error_message = None
+        task.error_message = None if not verification or verification.all_ok else (
+            "验片不通过: " + verification.details
+        )
         task.failed_segments = []
         task.decrypt_failed = []
         task.verification = verification
+        if verification and not verification.all_ok:
+            task.fail_type = VERIFY_FAIL_SEGMENT_COUNT
+            if not verification.output_exists_ok:
+                task.fail_type = VERIFY_FAIL_NO_OUTPUT
+            elif verification.fail_types:
+                task.fail_type = verification.fail_types[0]
+        else:
+            task.fail_type = None
+        task.suggestion = None
         task.finished_at = datetime.now().isoformat(timespec='seconds')
         if task.started_at:
             try:
@@ -182,7 +235,9 @@ class TaskRecorder:
                     failed_segments: Optional[List[int]] = None,
                     decrypt_failed: Optional[List[int]] = None,
                     total_segments: int = 0,
-                    downloaded_bytes: int = 0):
+                    downloaded_bytes: int = 0,
+                    fail_type: Optional[str] = None,
+                    suggestion: Optional[str] = None):
         task = self.get_or_create(url)
         task.status = TASK_STATUS_FAILED
         task.error_message = error_message
@@ -192,6 +247,8 @@ class TaskRecorder:
             task.failed_segments = sorted(failed_segments)
         if decrypt_failed:
             task.decrypt_failed = sorted(decrypt_failed)
+        task.fail_type = fail_type
+        task.suggestion = suggestion
         task.finished_at = datetime.now().isoformat(timespec='seconds')
         if task.started_at:
             try:
@@ -207,7 +264,7 @@ class TaskRecorder:
         if key not in self.tasks:
             return False
         task = self.tasks[key]
-        if task.status not in (TASK_STATUS_SUCCESS, TASK_STATUS_VERIFY_FAILED):
+        if task.status != TASK_STATUS_SUCCESS:
             return False
         if task.output_file and os.path.exists(task.output_file):
             return True
@@ -262,7 +319,7 @@ class TaskRecorder:
 
     def list_success(self) -> List[TaskRecord]:
         return [t for t in self.tasks.values()
-                if t.status in (TASK_STATUS_SUCCESS, TASK_STATUS_VERIFY_FAILED)]
+                if t.status == TASK_STATUS_SUCCESS]
 
     def list_skipped(self) -> List[TaskRecord]:
         return [t for t in self.tasks.values()
@@ -271,6 +328,106 @@ class TaskRecorder:
     def list_verify_failed(self) -> List[TaskRecord]:
         return [t for t in self.tasks.values()
                 if t.status == TASK_STATUS_VERIFY_FAILED]
+
+    def list_by_fail_type(self, fail_type: str) -> List[TaskRecord]:
+        return [t for t in self.tasks.values()
+                if t.status in (TASK_STATUS_FAILED, TASK_STATUS_VERIFY_FAILED)
+                and t.fail_type == fail_type]
+
+    def get_fail_type_groups(self,
+                              group: Optional[str] = None) -> Dict[str, List[TaskRecord]]:
+        buckets: Dict[str, List[TaskRecord]] = {}
+        for t in self.tasks.values():
+            if t.status not in (TASK_STATUS_FAILED, TASK_STATUS_VERIFY_FAILED):
+                continue
+            if group and t.group != group:
+                continue
+            ft = t.fail_type or UNKNOWN_FAIL
+            buckets.setdefault(ft, []).append(t)
+        return buckets
+
+    def get_queue_view(self, group: Optional[str] = None) -> Dict[str, Dict[str, int]]:
+        view: Dict[str, Dict[str, int]] = {}
+        groups_to_check: List[str]
+        if group:
+            groups_to_check = [group]
+        else:
+            groups_set: List[str] = []
+            for t in self.tasks.values():
+                if t.group and t.group not in groups_set:
+                    groups_set.append(t.group)
+            groups_to_check = sorted(groups_set) or ["(无分组)"]
+        for g in groups_to_check:
+            if g == "(无分组)":
+                records = [t for t in self.tasks.values() if not t.group]
+            else:
+                records = [t for t in self.tasks.values() if t.group == g]
+            bucket = {
+                "total": len(records),
+                TASK_STATUS_PENDING: 0,
+                TASK_STATUS_RUNNING: 0,
+                TASK_STATUS_FAILED: 0,
+                TASK_STATUS_VERIFY_FAILED: 0,
+                TASK_STATUS_SUCCESS: 0,
+                TASK_STATUS_SKIPPED: 0,
+            }
+            for t in records:
+                if t.status in bucket:
+                    bucket[t.status] += 1
+            view[g] = bucket
+        return view
+
+    def format_queue_view(self, group: Optional[str] = None) -> str:
+        view = self.get_queue_view(group=group)
+        lines = []
+        lines.append("=" * 80)
+        lines.append("任务队列视图")
+        lines.append(f"生成时间: {datetime.now().isoformat(timespec='seconds')}")
+        lines.append("=" * 80)
+        header = (f"{'分组':<24} {'总数':>5} {'待跑':>5} {'运行':>5} {'失败':>5} "
+                  f"{'异常':>5} {'成功':>5} {'跳过':>5}")
+        lines.append(header)
+        lines.append("-" * 80)
+        for g, stat in view.items():
+            name = g if len(g) <= 22 else (g[:19] + "...")
+            lines.append(
+                f"{name:<24} {stat['total']:>5} "
+                f"{stat[TASK_STATUS_PENDING]:>5} {stat[TASK_STATUS_RUNNING]:>5} "
+                f"{stat[TASK_STATUS_FAILED]:>5} {stat[TASK_STATUS_VERIFY_FAILED]:>5} "
+                f"{stat[TASK_STATUS_SUCCESS]:>5} {stat[TASK_STATUS_SKIPPED]:>5}"
+            )
+        lines.append("=" * 80)
+        return "\n".join(lines)
+
+    def export_failed_urls(self, output_file: str,
+                           group: Optional[str] = None,
+                           include_verify_failed: bool = True) -> int:
+        urls: List[str] = []
+        for t in self.tasks.values():
+            if t.status == TASK_STATUS_FAILED:
+                pass
+            elif t.status == TASK_STATUS_VERIFY_FAILED and include_verify_failed:
+                pass
+            else:
+                continue
+            if group and t.group != group:
+                continue
+            urls.append(t.url)
+        if not urls:
+            try:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write("")
+            except Exception:
+                pass
+            return 0
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                for u in urls:
+                    f.write(u + "\n")
+            return len(urls)
+        except Exception as e:
+            print(f"导出失败清单错误: {e}")
+            return 0
 
     def get_groups(self) -> List[str]:
         groups = set()
@@ -350,6 +507,10 @@ class TaskRecorder:
                     "failed": [t.to_dict() for t in failed_list],
                     "skipped": [t.to_dict() for t in skipped_list],
                     "pending": [t.to_dict() for t in pending_list],
+                    "fail_type_groups": {
+                        k: [t.to_dict() for t in v]
+                        for k, v in self.get_fail_type_groups(group=group).items()
+                    }
                 }
                 with open(report_file, 'w', encoding='utf-8') as f:
                     json.dump(report_data, f, ensure_ascii=False, indent=2)
@@ -373,6 +534,8 @@ class TaskRecorder:
                 lines.append(f"  跳过:     {group_stats[TASK_STATUS_SKIPPED]}")
                 lines.append(f"  待处理:   {group_stats[TASK_STATUS_PENDING]}")
                 lines.append(f"  运行中:   {group_stats[TASK_STATUS_RUNNING]}")
+                lines.append(f"  有效成功: {group_stats[TASK_STATUS_SUCCESS]}")
+                lines.append(f"  异常合计: {group_stats[TASK_STATUS_FAILED]+group_stats[TASK_STATUS_VERIFY_FAILED]}")
                 lines.append("")
 
                 total_bytes = sum(t.downloaded_bytes for t in success_list)
@@ -392,6 +555,53 @@ class TaskRecorder:
                                      f"成功={gs[TASK_STATUS_SUCCESS]} "
                                      f"失败={gs[TASK_STATUS_FAILED]} "
                                      f"异常={gs[TASK_STATUS_VERIFY_FAILED]}")
+                    lines.append("")
+
+                fail_type_groups = self.get_fail_type_groups(group=group)
+                if fail_type_groups:
+                    lines.append("=" * 70)
+                    lines.append("【异常类型分组】")
+                    lines.append("-" * 70)
+                    type_names = {
+                        VERIFY_FAIL_NO_OUTPUT: "输出文件不存在",
+                        VERIFY_FAIL_SEGMENT_COUNT: "分片数量不匹配",
+                        VERIFY_FAIL_FILE_SIZE: "文件大小异常",
+                        VERIFY_FAIL_DURATION: "输出时长偏差大",
+                        VERIFY_FAIL_FFPROBE: "ffprobe 无法探测",
+                        DOWNLOAD_FAIL_HTTP_AUTH: "HTTP 鉴权失败 401/403",
+                        DOWNLOAD_FAIL_HTTP_NOT_FOUND: "HTTP 资源不存在 404",
+                        DOWNLOAD_FAIL_HTTP_RATE_LIMIT: "HTTP 频率限制 429",
+                        DOWNLOAD_FAIL_HTTP_SERVER: "HTTP 服务器错误 5xx",
+                        DOWNLOAD_FAIL_TIMEOUT: "网络请求超时",
+                        DOWNLOAD_FAIL_DNS: "DNS 解析失败",
+                        DOWNLOAD_FAIL_CONNECTION: "网络连接失败",
+                        DOWNLOAD_FAIL_SEGMENTS: "下载分片缺失",
+                        DOWNLOAD_FAIL_DECRYPT: "解密失败",
+                        MERGE_FAIL_FFMPEG: "FFmpeg 合并失败",
+                        MERGE_FAIL_NO_SEGMENTS: "无可合并分片",
+                        UNKNOWN_FAIL: "其他未归类错误",
+                    }
+                    for ft, items in sorted(fail_type_groups.items(),
+                                             key=lambda kv: -len(kv[1])):
+                        name = type_names.get(ft, ft)
+                        lines.append(f"  [{name}]  {len(items)} 条")
+                        sample = items[:3]
+                        for s in sample:
+                            if s.error_message:
+                                snippet = s.error_message[:80]
+                                lines.append(f"    - {snippet}{'...' if len(s.error_message) > 80 else ''}")
+                            if s.suggestion:
+                                lines.append(f"      建议: {s.suggestion[:100]}")
+                        if len(items) > 3:
+                            lines.append(f"    ... 还有 {len(items)-3} 条")
+                    lines.append("")
+
+                if pending_list:
+                    lines.append("=" * 70)
+                    lines.append(f"【待处理任务】 ({len(pending_list)} 个)")
+                    lines.append("-" * 70)
+                    for t in pending_list:
+                        lines.append(f"  URL: {t.url}")
                     lines.append("")
 
                 if success_list:

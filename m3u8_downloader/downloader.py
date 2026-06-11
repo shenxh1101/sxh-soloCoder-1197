@@ -14,7 +14,8 @@ from .utils import (
     format_size,
     format_speed,
     format_time,
-    classify_http_error
+    classify_http_error,
+    classify_request_exception,
 )
 
 
@@ -28,6 +29,8 @@ class DownloadResult:
         self.total_bytes: int = 0
         self.cancelled = False
         self.error_message: Optional[str] = None
+        self.fail_type: Optional[str] = None
+        self.suggestion: Optional[str] = None
 
     @property
     def success_count(self) -> int:
@@ -63,6 +66,59 @@ class DownloadResult:
                 lines.append(f"  分片 {idx}: {err}")
         return "\n".join(lines)
 
+    def set_dominant_fail(self):
+        from .task_recorder import (
+            DOWNLOAD_FAIL_HTTP_AUTH, DOWNLOAD_FAIL_HTTP_NOT_FOUND,
+            DOWNLOAD_FAIL_HTTP_RATE_LIMIT, DOWNLOAD_FAIL_HTTP_SERVER,
+            DOWNLOAD_FAIL_TIMEOUT, DOWNLOAD_FAIL_DNS,
+            DOWNLOAD_FAIL_CONNECTION, DOWNLOAD_FAIL_SEGMENTS,
+            DOWNLOAD_FAIL_DECRYPT,
+        )
+        bucket_counts: Dict[str, int] = {}
+        bucket_suggestion: Dict[str, str] = {}
+        for _idx, err in self.failed_segments.items():
+            e = err.lower()
+            if "鉴权失败" in e or "401" in e or "403" in e:
+                k = DOWNLOAD_FAIL_HTTP_AUTH
+                s = "建议: 使用 --cookie 加载浏览器 Cookie，或 --header 添加 Authorization/Referer"
+            elif "资源不存在" in e or "404" in e or "410" in e:
+                k = DOWNLOAD_FAIL_HTTP_NOT_FOUND
+                s = "建议: 分片 URL 已失效，尝试重新获取 m3u8 或检查 URL 是否过期"
+            elif "频率限制" in e or "429" in e:
+                k = DOWNLOAD_FAIL_HTTP_RATE_LIMIT
+                s = "建议: 被限流，降低 --concurrency 并发数，或稍后重试"
+            elif "服务器错误" in e or "500" in e or "502" in e or "503" in e:
+                k = DOWNLOAD_FAIL_HTTP_SERVER
+                s = "建议: 目标服务器故障，稍后重试或切换源"
+            elif "超时" in e or "timeout" in e:
+                k = DOWNLOAD_FAIL_TIMEOUT
+                s = "建议: 增大 --timeout 或降低并发数"
+            elif "dns" in e or "解析失败" in e or "resolve" in e:
+                k = DOWNLOAD_FAIL_DNS
+                s = "建议: DNS 解析失败，检查网络或使用 --proxy"
+            elif "连接" in e or "connection" in e or "proxy" in e:
+                k = DOWNLOAD_FAIL_CONNECTION
+                s = "建议: 连接失败，检查网络代理"
+            else:
+                k = DOWNLOAD_FAIL_SEGMENTS
+                s = "建议: 分片下载失败，稍后重试或降低并发"
+            bucket_counts[k] = bucket_counts.get(k, 0) + 1
+            bucket_suggestion.setdefault(k, s)
+        if self.decrypt_failed:
+            bucket_counts[DOWNLOAD_FAIL_DECRYPT] = (
+                bucket_counts.get(DOWNLOAD_FAIL_DECRYPT, 0)
+                + len(self.decrypt_failed)
+            )
+            bucket_suggestion[DOWNLOAD_FAIL_DECRYPT] = (
+                "建议: 解密失败，检查 AES-128 密钥和 IV 是否正确，"
+                "m3u8 是否带 EXT-X-MEDIA-SEQUENCE 非0起始序号"
+            )
+        if not bucket_counts:
+            return
+        top = max(bucket_counts.items(), key=lambda kv: kv[1])
+        self.fail_type = top[0]
+        self.suggestion = bucket_suggestion.get(top[0])
+
 
 class DownloadProgress:
     def __init__(self, total_segments: int, estimated_total_bytes: int = 0):
@@ -76,12 +132,16 @@ class DownloadProgress:
         self.last_update_time = time.time()
         self.last_bytes = 0
         self.current_speed = 0
+        self._peak_percentage = 0.0
+        self._peak_display_bytes = 0
         self._lock = threading.Lock()
         self._running = True
 
     def add_in_progress(self, size_bytes: int):
         with self._lock:
             self.in_progress_bytes += size_bytes
+            if self.in_progress_bytes > self._peak_display_bytes:
+                self._peak_display_bytes = self.in_progress_bytes
 
     def remove_in_progress(self, size_bytes: int):
         with self._lock:
@@ -114,10 +174,16 @@ class DownloadProgress:
                 total_elapsed = now - self.start_time
                 if total_elapsed > 0.3:
                     self.current_speed = self.downloaded_bytes / total_elapsed
+            elif self.in_progress_bytes > 0 and self.current_speed == 0:
+                total_elapsed = now - self.start_time
+                if total_elapsed > 0.3:
+                    live_total = self.downloaded_bytes + self.in_progress_bytes
+                    self.current_speed = live_total / total_elapsed
 
     @property
     def total_display_bytes(self) -> int:
-        return self.downloaded_bytes + self.in_progress_bytes
+        raw = self.downloaded_bytes + self.in_progress_bytes
+        return max(raw, self._peak_display_bytes)
 
     @property
     def estimated_remaining_bytes(self) -> int:
@@ -144,17 +210,27 @@ class DownloadProgress:
         if total <= 0:
             if self.total_segments == 0:
                 return 100.0
-            return (self.completed_segments / self.total_segments) * 100
-        display = self.total_display_bytes
-        if display >= total:
-            if self.total_segments > 0:
-                return min(99.9, (self.completed_segments / self.total_segments) * 100)
-            return 99.9
-        byte_pct = (display / total) * 100
-        if self.total_segments > 0:
-            seg_pct = (self.completed_segments / self.total_segments) * 100
-            return max(byte_pct, seg_pct * 0.3)
-        return byte_pct
+            base_pct = (self.completed_segments / self.total_segments) * 100
+        else:
+            display = self.total_display_bytes
+            if display >= total:
+                base_pct = (
+                    min(99.9, (self.completed_segments / self.total_segments) * 100)
+                    if self.total_segments > 0 else 99.9
+                )
+            else:
+                byte_pct = (display / total) * 100
+                seg_pct = (
+                    (self.completed_segments / self.total_segments) * 100 * 0.3
+                    if self.total_segments > 0 else 0
+                )
+                base_pct = max(byte_pct, seg_pct)
+        with self._lock:
+            if base_pct < self._peak_percentage:
+                base_pct = self._peak_percentage
+            elif base_pct > self._peak_percentage:
+                self._peak_percentage = base_pct
+        return base_pct
 
     @property
     def elapsed_time(self) -> float:
@@ -275,7 +351,7 @@ class M3U8Downloader:
         except Exception:
             return None
 
-    def _download_single_segment(self, segment: Segment) -> tuple[bool, int, str]:
+    def _download_single_segment(self, segment: Segment) -> tuple[bool, int, str, str]:
         filename = get_ts_filename(segment.index)
         filepath = os.path.join(self.output_dir, filename)
         temp_filepath = filepath + ".part"
@@ -283,9 +359,10 @@ class M3U8Downloader:
         if self.resume and os.path.exists(filepath):
             size = os.path.getsize(filepath)
             if size > 0:
-                return True, size, "already_downloaded"
+                return True, size, "already_downloaded", ""
 
         last_error = ""
+        last_suggestion = ""
         total_progress_reported = 0
 
         for attempt in range(self.retries):
@@ -326,7 +403,7 @@ class M3U8Downloader:
                 os.rename(temp_filepath, filepath)
 
                 total_progress_reported += attempt_bytes
-                return True, attempt_bytes, ""
+                return True, attempt_bytes, "", ""
 
             except requests.exceptions.HTTPError as e:
                 resp = getattr(e, 'response', None)
@@ -334,14 +411,19 @@ class M3U8Downloader:
                 err_type = classify_http_error(status_code)
                 if err_type == "auth":
                     last_error = f"鉴权失败 (HTTP {status_code}): 需要 Cookie 或登录态"
+                    last_suggestion = "建议: 使用 --cookie 加载浏览器 Cookie 或 --header 添加 Authorization/Referer"
                 elif err_type == "not_found":
                     last_error = f"资源不存在 (HTTP {status_code})"
+                    last_suggestion = "建议: 分片 URL 已过期，尝试重新获取最新 m3u8 地址"
                 elif err_type == "rate_limit":
                     last_error = f"请求频率限制 (HTTP {status_code})"
+                    last_suggestion = "建议: 降低 --concurrency 并发数或稍后重试"
                 elif err_type == "server_error":
                     last_error = f"服务器错误 (HTTP {status_code})"
+                    last_suggestion = "建议: 目标服务器暂时故障，稍后重试或切换镜像源"
                 else:
                     last_error = str(e)
+                    last_suggestion = ""
                 if attempt_bytes > 0 and self._progress:
                     self._progress.remove_in_progress(attempt_bytes)
                 total_progress_reported = max(0, total_progress_reported - attempt_bytes)
@@ -351,12 +433,13 @@ class M3U8Downloader:
                     except:
                         pass
                 if err_type == "auth":
-                    return False, 0, last_error
+                    return False, 0, last_error, last_suggestion
                 if attempt < self.retries - 1:
                     backoff = min(2 ** attempt, 10)
                     time.sleep(backoff)
             except Exception as e:
                 last_error = str(e)
+                _, last_suggestion = classify_request_exception(e)
                 if attempt_bytes > 0 and self._progress:
                     self._progress.remove_in_progress(attempt_bytes)
                 total_progress_reported = max(0, total_progress_reported - attempt_bytes)
@@ -369,7 +452,7 @@ class M3U8Downloader:
                     backoff = min(2 ** attempt, 10)
                     time.sleep(backoff)
 
-        return False, 0, last_error
+        return False, 0, last_error, last_suggestion
 
     def _decrypt_segment(self, segment: Segment) -> tuple[bool, str]:
         if segment.encryption.method == "NONE":
@@ -443,7 +526,7 @@ class M3U8Downloader:
             for future in as_completed(future_to_segment):
                 segment = future_to_segment[future]
                 try:
-                    ok, size, note = future.result()
+                    ok, size, note, suggestion = future.result()
                     if ok:
                         if self._progress:
                             self._progress.add_completed(size)
@@ -451,6 +534,8 @@ class M3U8Downloader:
                         self.result.total_bytes += size
                     else:
                         self.result.failed_segments[segment.index] = note or "未知错误"
+                        if suggestion and not self.result.suggestion:
+                            self.result.suggestion = suggestion
                         download_errors += 1
                         if download_errors >= 20:
                             self.result.cancelled = True
@@ -470,8 +555,11 @@ class M3U8Downloader:
             self._progress_bar.finish(self._progress)
 
         if not self.result.can_merge:
+            self.result.set_dominant_fail()
             print("下载阶段结束，但有分片缺失：")
             print(self.result.list_failed())
+            if self.result.suggestion:
+                print(self.result.suggestion)
             return self.result
 
         if self.playlist.is_encrypted:

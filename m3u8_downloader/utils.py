@@ -75,6 +75,32 @@ def get_decrypted_ts_filename(index):
     return f"segment_{index:05d}_dec.ts"
 
 
+def load_cookies_from_string(cookie_str: str) -> dict:
+    cookies = {}
+    if not cookie_str:
+        return cookies
+    for token in cookie_str.split(';'):
+        token = token.strip()
+        if not token or '=' not in token:
+            continue
+        name, _, value = token.partition('=')
+        name = name.strip()
+        value = value.strip()
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+def load_cookies_from_env(env_names: list = None) -> dict:
+    if env_names is None:
+        env_names = ["M3U8_COOKIE", "M3U8_COOKIES", "HTTP_COOKIE"]
+    for name in env_names:
+        val = os.environ.get(name) or os.environ.get(name.upper())
+        if val:
+            return load_cookies_from_string(val)
+    return {}
+
+
 def load_cookies_from_file(cookie_file: str) -> dict:
     cookies = {}
     if not cookie_file or not os.path.exists(cookie_file):
@@ -99,6 +125,21 @@ def load_cookies_from_file(cookie_file: str) -> dict:
                         cookies[name.strip()] = value.strip()
         except Exception:
             pass
+    return cookies
+
+
+def load_cookies(
+    cookie_file: str = None,
+    cookie_string: str = None,
+    use_env: bool = True,
+) -> dict:
+    cookies = {}
+    if use_env:
+        cookies.update(load_cookies_from_env())
+    if cookie_string:
+        cookies.update(load_cookies_from_string(cookie_string))
+    if cookie_file:
+        cookies.update(load_cookies_from_file(cookie_file))
     return cookies
 
 
@@ -150,3 +191,43 @@ def classify_http_error(status_code: int, url: str = "") -> str:
     if 500 <= status_code < 600:
         return "server_error"
     return "unknown"
+
+
+def classify_request_exception(exception: Exception) -> tuple[str, str]:
+    """返回 (fail_type, suggestion)"""
+    import requests
+    msg = str(exception).lower()
+
+    if isinstance(exception, requests.exceptions.Timeout):
+        return "timeout", "建议: 尝试增大 --timeout 参数或稍后重试，若服务器较慢可将并发数从5下调至2-3"
+    if isinstance(exception, requests.exceptions.ConnectTimeout):
+        return "timeout", "建议: 建立连接超时，检查网络延迟或代理设置"
+    if isinstance(exception, requests.exceptions.ReadTimeout):
+        return "timeout", "建议: 读取响应超时，服务器响应慢，可加大 --timeout 或降低并发"
+
+    if isinstance(exception, requests.exceptions.ProxyError):
+        return "connection", "建议: 代理服务器不可用，检查 --proxy 参数或切换网络"
+    if isinstance(exception, requests.exceptions.SSLError):
+        return "connection", "建议: SSL/TLS 握手失败，可能是 HTTPS 证书问题或中间人攻击"
+    if isinstance(exception, requests.exceptions.ConnectionError):
+        if ("name or service not known" in msg
+                or "getaddrinfo failed" in msg
+                or "dns" in msg
+                or "could not resolve" in msg):
+            return "dns", "建议: DNS 解析失败，检查域名拼写、本机 DNS 设置或切换网络"
+        if "connection refused" in msg or "拒绝连接" in msg:
+            return "connection", "建议: 连接被拒绝，目标服务器可能宕机或端口未开放"
+        if ("no route to host" in msg
+                or "network is unreachable" in msg):
+            return "connection", "建议: 无法到达目标主机，检查网络链路或使用 --proxy"
+        if "connection reset" in msg:
+            return "connection", "建议: 连接被重置，可能是服务器限流，建议降低并发或稍后重试"
+        return "connection", "建议: 网络连接失败，检查本机网络、代理设置或稍后重试"
+
+    if isinstance(exception, requests.exceptions.ChunkedEncodingError):
+        return "connection", "建议: 数据传输中断，可能是大分片或网络抖动，可重试或降低并发"
+    if isinstance(exception, requests.exceptions.ContentDecodingError):
+        return "connection", "建议: 响应解码失败，可能是响应被截断或压缩格式异常"
+
+    return "unknown", "建议: 未知网络错误，检查 -v 输出或稍后重试"
+
