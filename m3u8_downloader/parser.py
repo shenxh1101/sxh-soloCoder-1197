@@ -1,7 +1,7 @@
 import re
 import requests
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .utils import resolve_url, get_base_url
 
@@ -20,6 +20,7 @@ class Segment:
     url: str
     duration: float = 0.0
     encryption: EncryptionInfo = field(default_factory=EncryptionInfo)
+    byte_size: Optional[int] = None
 
 
 @dataclass
@@ -32,10 +33,37 @@ class M3U8Playlist:
 
 @dataclass
 class MasterPlaylistEntry:
+    index: int
     url: str
     bandwidth: int = 0
     resolution: Optional[str] = None
     codecs: Optional[str] = None
+
+    @property
+    def quality_label(self) -> str:
+        parts = []
+        if self.resolution:
+            parts.append(self.resolution)
+        if self.bandwidth > 0:
+            mbps = self.bandwidth / 1_000_000
+            parts.append(f"{mbps:.2f}Mbps")
+        if not parts:
+            parts.append(f"Stream {self.index}")
+        return " | ".join(parts)
+
+
+def format_quality_table(entries: List[MasterPlaylistEntry]) -> str:
+    lines = ["可用清晰度列表："]
+    lines.append("-" * 70)
+    lines.append(f"{'序号':<6}{'分辨率':<14}{'码率':<14}{'编码':<14}")
+    lines.append("-" * 70)
+    for e in entries:
+        bw_str = f"{e.bandwidth / 1_000_000:.2f}Mbps" if e.bandwidth else "-"
+        res_str = e.resolution or "-"
+        codec_str = e.codecs or "-"
+        lines.append(f"{e.index:<6}{res_str:<14}{bw_str:<14}{codec_str:<14}")
+    lines.append("-" * 70)
+    return "\n".join(lines)
 
 
 class M3U8Parser:
@@ -70,6 +98,7 @@ class M3U8Parser:
         if content is None:
             content = self.fetch()
         entries = []
+        idx = 0
         lines = content.strip().split("\n")
         i = 0
         while i < len(lines):
@@ -84,11 +113,13 @@ class M3U8Parser:
                     if url and not url.startswith("#"):
                         full_url = resolve_url(self.base_url, url)
                         entries.append(MasterPlaylistEntry(
+                            index=idx,
                             url=full_url,
                             bandwidth=bandwidth,
                             resolution=resolution,
                             codecs=codecs
                         ))
+                        idx += 1
                         i += 1
             i += 1
         return entries
@@ -163,7 +194,54 @@ class M3U8Parser:
 
         return playlist
 
-    def parse(self, select_highest_quality: bool = True) -> M3U8Playlist:
+    def get_master_entries(self) -> List[MasterPlaylistEntry]:
+        content = self.fetch()
+        if self.is_master_playlist(content):
+            return self.parse_master_playlist(content)
+        return []
+
+    def select_quality(self,
+                       entries: List[MasterPlaylistEntry],
+                       select_index: Optional[int] = None,
+                       target_bandwidth: Optional[int] = None,
+                       target_resolution: Optional[str] = None,
+                       select_highest: bool = True) -> MasterPlaylistEntry:
+        if not entries:
+            raise ValueError("No streams available")
+
+        if select_index is not None:
+            if 0 <= select_index < len(entries):
+                return entries[select_index]
+            raise ValueError(f"清晰度序号 {select_index} 超出范围 (0-{len(entries)-1})")
+
+        if target_resolution:
+            for e in entries:
+                if e.resolution and e.resolution.lower() == target_resolution.lower():
+                    return e
+            raise ValueError(f"未找到分辨率为 {target_resolution} 的流")
+
+        if target_bandwidth is not None:
+            best = None
+            best_diff = float('inf')
+            for e in entries:
+                diff = abs(e.bandwidth - target_bandwidth)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = e
+            if best:
+                return best
+
+        sorted_entries = sorted(entries, key=lambda x: x.bandwidth, reverse=True)
+        if select_highest:
+            return sorted_entries[0]
+        else:
+            return sorted_entries[-1] if len(sorted_entries) > 1 else sorted_entries[0]
+
+    def parse(self,
+              select_highest_quality: bool = True,
+              quality_index: Optional[int] = None,
+              target_bandwidth: Optional[int] = None,
+              target_resolution: Optional[str] = None) -> M3U8Playlist:
         content = self.fetch()
 
         if self.is_master_playlist(content):
@@ -171,11 +249,13 @@ class M3U8Parser:
             if not entries:
                 raise ValueError("No streams found in master playlist")
 
-            if select_highest_quality:
-                entries.sort(key=lambda x: x.bandwidth, reverse=True)
-                selected = entries[0]
-            else:
-                selected = entries[0]
+            selected = self.select_quality(
+                entries,
+                select_index=quality_index,
+                target_bandwidth=target_bandwidth,
+                target_resolution=target_resolution,
+                select_highest=select_highest_quality
+            )
 
             parser = M3U8Parser(selected.url, proxies=self.proxies, headers=self.headers)
             return parser.parse_media_playlist()
