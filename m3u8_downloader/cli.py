@@ -1,7 +1,7 @@
 import argparse
 import os
 import sys
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from .parser import (
     M3U8Parser,
@@ -10,19 +10,25 @@ from .parser import (
     parse_time_str
 )
 from .downloader import M3U8Downloader, DownloadResult
-from .merger import FFmpegMerger, cleanup_temp_dir
+from .merger import FFmpegMerger, cleanup_temp_dir, verify_output
 from .task_recorder import (
     TaskRecorder,
+    TaskRecord,
     TASK_STATUS_SUCCESS,
     TASK_STATUS_PENDING,
     TASK_STATUS_RUNNING,
-    TASK_STATUS_FAILED
+    TASK_STATUS_FAILED,
+    TASK_STATUS_VERIFY_FAILED
 )
 from .utils import (
     get_temp_dir,
     sanitize_filename,
     format_size,
-    format_time
+    format_time,
+    load_cookies_from_file,
+    parse_header_string,
+    build_headers,
+    classify_http_error
 )
 
 
@@ -72,16 +78,29 @@ def _check_existing_output(output_file: str, resume: bool) -> bool:
     return False
 
 
+def _build_request_headers(custom_header_str: Optional[str],
+                            cookie_file: Optional[str]) -> dict:
+    custom_headers = parse_header_string(custom_header_str) if custom_header_str else {}
+    cookies = load_cookies_from_file(cookie_file) if cookie_file else {}
+    headers = build_headers(custom_headers=custom_headers, cookies=cookies)
+    if cookies:
+        print(f"已加载 {len(cookies)} 个 Cookie")
+    if custom_headers:
+        print(f"已加载 {len(custom_headers)} 个自定义 Header")
+    return headers
+
+
 def _parse_playlist(url: str, proxies: Optional[dict],
                      quality_index: Optional[int],
                      target_resolution: Optional[str],
                      target_bandwidth_mbps: Optional[float],
-                     list_qualities: bool) -> Tuple[Optional[M3U8Parser],
+                     list_qualities: bool,
+                     headers: Optional[dict] = None) -> Tuple[Optional[M3U8Parser],
                                                       Optional[List[MasterPlaylistEntry]],
                                                       Optional[object],
                                                       Optional[str]]:
     try:
-        parser = M3U8Parser(url, proxies=proxies)
+        parser = M3U8Parser(url, proxies=proxies, headers=headers)
         entries = parser.get_master_entries()
 
         if entries and list_qualities:
@@ -119,6 +138,9 @@ def _parse_playlist(url: str, proxies: Optional[dict],
         return parser, entries, playlist, None
 
     except Exception as e:
+        err_str = str(e)
+        if "401" in err_str or "403" in err_str:
+            return None, None, None, f"鉴权失败: {err_str} (请检查 Cookie 或自定义 Header)"
         return None, None, None, f"解析 m3u8 失败: {e}"
 
 
@@ -132,6 +154,7 @@ def download_single(
     resume: bool = True,
     keep_temp: bool = False,
     ffmpeg_path: str = "ffmpeg",
+    ffprobe_path: str = "ffprobe",
     verbose: bool = False,
     quality_index: Optional[int] = None,
     target_resolution: Optional[str] = None,
@@ -139,7 +162,10 @@ def download_single(
     list_qualities_only: bool = False,
     task_recorder: Optional[TaskRecorder] = None,
     start_sec: Optional[float] = None,
-    end_sec: Optional[float] = None
+    end_sec: Optional[float] = None,
+    custom_headers: Optional[dict] = None,
+    group: Optional[str] = None,
+    verify: bool = False
 ) -> Tuple[bool, str]:
     proxies = parse_proxy(proxy)
 
@@ -152,7 +178,8 @@ def download_single(
     print(f"\n正在解析 m3u8: {url}")
     parser, entries, playlist, err = _parse_playlist(
         url, proxies, quality_index, target_resolution,
-        target_bandwidth_mbps, list_qualities_only
+        target_bandwidth_mbps, list_qualities_only,
+        headers=custom_headers
     )
 
     if err == "LISTED":
@@ -198,6 +225,7 @@ def download_single(
             return False, msg
 
     total_segments = len(playlist.segments)
+    expected_duration = playlist.duration
     print(f"找到 {total_segments} 个分片")
     if playlist.duration > 0:
         print(f"总时长: {format_time(playlist.duration)}")
@@ -211,7 +239,8 @@ def download_single(
 
     if task_recorder:
         task_recorder.mark_running(
-            url, output_format, selected_quality_idx, quality_label_for_log
+            url, output_format, selected_quality_idx, quality_label_for_log,
+            group=group, output_dir=output_dir
         )
 
     temp_dir = get_temp_dir(output_dir)
@@ -224,6 +253,7 @@ def download_single(
         output_dir=temp_dir,
         concurrency=concurrency,
         proxies=proxies,
+        headers=custom_headers,
         resume=resume,
         retries=5,
         timeout=60
@@ -265,7 +295,7 @@ def download_single(
 
     print("下载和解密全部完成，开始合并...")
 
-    merger = FFmpegMerger(ffmpeg_path=ffmpeg_path)
+    merger = FFmpegMerger(ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path)
     if not merger.check_ffmpeg():
         msg = "未找到 ffmpeg，请确保 ffmpeg 已安装并在 PATH 中"
         print(f"错误: {msg}")
@@ -301,6 +331,19 @@ def download_single(
 
     print("✓ 合并完成!")
 
+    verification = None
+    if verify:
+        print("正在校验输出文件...")
+        ver_result = verify_output(
+            output_file, total_segments, expected_duration,
+            ffprobe_path=ffprobe_path
+        )
+        verification = ver_result["verification"]
+        if ver_result["ok"]:
+            print(f"  ✓ 校验通过: {verification.details}")
+        else:
+            print(f"  ✗ 校验未通过: {verification.details}")
+
     if os.path.exists(output_file):
         file_size = os.path.getsize(output_file)
         print(f"  输出文件: {output_file}")
@@ -313,8 +356,12 @@ def download_single(
 
     if task_recorder:
         task_recorder.mark_success(
-            url, output_file, total_segments, result.total_bytes
+            url, output_file, total_segments, result.total_bytes,
+            verification=verification
         )
+
+    if verification and not verification.all_ok:
+        return True, f"下载完成但校验异常: {verification.details}"
 
     return True, "成功"
 
@@ -328,6 +375,7 @@ def download_batch(
     resume: bool = True,
     keep_temp: bool = False,
     ffmpeg_path: str = "ffmpeg",
+    ffprobe_path: str = "ffprobe",
     verbose: bool = False,
     quality_index: Optional[int] = None,
     target_resolution: Optional[str] = None,
@@ -335,10 +383,14 @@ def download_batch(
     task_log_file: Optional[str] = None,
     skip_completed: bool = True,
     continue_task_log: Optional[str] = None,
+    continue_group: Optional[str] = None,
     export_report: bool = False,
     report_format: str = "txt",
     start_sec: Optional[float] = None,
-    end_sec: Optional[float] = None
+    end_sec: Optional[float] = None,
+    custom_headers: Optional[dict] = None,
+    group: Optional[str] = None,
+    verify: bool = False
 ) -> None:
     if continue_task_log:
         if not os.path.exists(continue_task_log):
@@ -346,12 +398,18 @@ def download_batch(
             sys.exit(1)
         task_log_file = continue_task_log
         recorder = TaskRecorder(task_log_file)
-        urls = recorder.get_retry_urls()
+        urls = recorder.get_retry_urls(group=continue_group)
         if not urls:
-            print("没有需要继续处理的任务（所有任务均已成功）")
+            if continue_group:
+                print(f"分组 '{continue_group}' 中没有需要继续处理的任务")
+            else:
+                print("没有需要继续处理的任务（所有任务均已成功）")
             print(recorder.format_summary())
             return
-        print(f"继续未完成任务: 从 {task_log_file} 读取")
+        if continue_group:
+            print(f"继续未完成任务: 分组 '{continue_group}'，从 {task_log_file} 读取")
+        else:
+            print(f"继续未完成任务: 从 {task_log_file} 读取")
         print(f"待处理任务数: {len(urls)}")
     else:
         if not url_list_file:
@@ -368,6 +426,8 @@ def download_batch(
 
     print(f"任务记录文件: {task_log_file}")
     print(recorder.format_summary())
+    if group:
+        print(f"当前分组: {group}")
     print()
 
     print(f"共 {len(urls)} 个URL待处理")
@@ -400,6 +460,7 @@ def download_batch(
                 resume=resume,
                 keep_temp=keep_temp,
                 ffmpeg_path=ffmpeg_path,
+                ffprobe_path=ffprobe_path,
                 verbose=verbose,
                 quality_index=quality_index,
                 target_resolution=target_resolution,
@@ -407,7 +468,10 @@ def download_batch(
                 list_qualities_only=False,
                 task_recorder=recorder,
                 start_sec=start_sec,
-                end_sec=end_sec
+                end_sec=end_sec,
+                custom_headers=custom_headers,
+                group=group,
+                verify=verify
             )
             if ok:
                 success_count += 1
@@ -445,6 +509,23 @@ def download_batch(
             if t.error_message:
                 print(f"    原因: {t.error_message[:100]}")
 
+    verify_failed = recorder.list_verify_failed()
+    if verify_failed:
+        print(f"\n校验异常任务列表 ({len(verify_failed)} 个):")
+        for t in verify_failed:
+            print(f"  {t.url}")
+            if t.verification and t.verification.details:
+                print(f"    详情: {t.verification.details[:100]}")
+
+    groups = recorder.get_groups()
+    if groups:
+        print(f"\n分组汇总:")
+        for g in groups:
+            gs = recorder.get_group_statistics(g)
+            print(f"  {g}: 成功={gs[TASK_STATUS_SUCCESS]} "
+                  f"失败={gs[TASK_STATUS_FAILED]} "
+                  f"异常={gs[TASK_STATUS_VERIFY_FAILED]}")
+
     if export_report or continue_task_log or fail_count > 0:
         report_file = recorder.export_report(format=report_format)
         if report_file:
@@ -461,32 +542,32 @@ def create_parser() -> argparse.ArgumentParser:
 1. 下载单个视频 (默认最高清晰度):
    %(prog)s https://example.com/video.m3u8
 
-2. 列出所有可选清晰度:
+2. 使用 Cookie 文件下载需要登录的视频:
+   %(prog)s -u https://example.com/video.m3u8 --cookie cookies.txt
+
+3. 传递自定义请求头 (防盗链 Referer):
+   %(prog)s -u https://example.com/video.m3u8 --header "Referer:https://example.com"
+
+4. 列出所有可选清晰度:
    %(prog)s -u https://example.com/video.m3u8 --list-qualities
 
-3. 按序号选择清晰度 (先 --list-qualities 查看序号):
-   %(prog)s -u https://example.com/video.m3u8 --quality 1
-
-4. 指定分辨率 (如 720p):
-   %(prog)s -u https://example.com/video.m3u8 --resolution 1280x720
-
-5. 指定目标码率 (Mbps):
-   %(prog)s -u https://example.com/video.m3u8 --bandwidth 2.0
-
-6. 下载指定时间范围 (从第10分钟到第25分钟):
+5. 下载指定时间范围 (从第10分钟到第25分钟):
    %(prog)s -u https://example.com/video.m3u8 --start 10:00 --end 25:00
 
-7. 批量下载 (自动记录状态，断点续跑自动跳过成功项):
-   %(prog)s -f urls.txt -d downloads/ -c 10
+6. 批量下载并指定分组:
+   %(prog)s -f urls.txt -d downloads/ --group drama_ep01
 
-8. 继续未完成的批量任务:
+7. 继续未完成的批量任务:
    %(prog)s --continue downloads/urls_tasks.json
 
-9. 使用代理:
-   %(prog)s -u https://example.com/video.m3u8 --proxy http://127.0.0.1:8080
+8. 继续某个分组的任务:
+   %(prog)s --continue downloads/urls_tasks.json --group drama_ep01
 
-10. 输出 MKV 格式并保留临时文件:
-    %(prog)s -u https://example.com/video.m3u8 --format mkv --keep-temp
+9. 下载后校验:
+   %(prog)s -u https://example.com/video.m3u8 --verify
+
+10. 使用代理:
+    %(prog)s -u https://example.com/video.m3u8 --proxy http://127.0.0.1:8080
         """
     )
 
@@ -545,9 +626,29 @@ def create_parser() -> argparse.ArgumentParser:
         help="ffmpeg 可执行文件路径 (默认: ffmpeg)"
     )
     parser.add_argument(
+        "--ffprobe",
+        default="ffprobe",
+        help="ffprobe 可执行文件路径 (默认: ffprobe)"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="显示详细输出"
+    )
+
+    auth_group = parser.add_argument_group("请求头与鉴权")
+    auth_group.add_argument(
+        "--header",
+        action="append",
+        default=None,
+        metavar="HEADER",
+        help="自定义请求头，格式 \"Name:Value\"，可多次使用，如 --header \"Referer:https://x.com\""
+    )
+    auth_group.add_argument(
+        "--cookie",
+        default=None,
+        metavar="COOKIE_FILE",
+        help="从浏览器导出的 Cookie 文件 (Netscape 格式或 name=value 逐行格式)"
     )
 
     quality_group = parser.add_argument_group("清晰度选择")
@@ -606,6 +707,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="继续未完成的任务，从指定的任务记录 JSON 读取失败/待处理的 URL，跳过成功项"
     )
     batch_group.add_argument(
+        "--group",
+        default=None,
+        help="批量下载分组名 (保存到任务记录中，--continue 时可按分组过滤)"
+    )
+    batch_group.add_argument(
         "--export-report",
         action="store_true",
         help="批量任务结束后导出汇总报告 (有失败任务时默认导出)"
@@ -616,11 +722,16 @@ def create_parser() -> argparse.ArgumentParser:
         default="txt",
         help="汇总报告格式: txt 或 json (默认: txt)"
     )
+    batch_group.add_argument(
+        "--verify",
+        action="store_true",
+        help="下载完成后校验输出文件 (分片数量、文件大小、时长、ffprobe 探测)"
+    )
 
     parser.add_argument(
         "--version",
         action="version",
-        version="m3u8-downloader 3.0.0 (enhanced)"
+        version="m3u8-downloader 4.0.0 (enhanced)"
     )
 
     return parser
@@ -649,6 +760,11 @@ def main() -> None:
         print("\n错误: 请指定 m3u8 URL (位置参数/-u) 或 URL 列表文件 (-f) 或 --continue")
         sys.exit(1)
 
+    custom_headers = _build_request_headers(
+        ",".join(args.header) if args.header else None,
+        args.cookie
+    )
+
     output_format = args.format.lower()
     resume = not args.no_resume
     output_dir = os.path.abspath(args.output_dir)
@@ -666,6 +782,7 @@ def main() -> None:
             resume=resume,
             keep_temp=args.keep_temp,
             ffmpeg_path=args.ffmpeg,
+            ffprobe_path=args.ffprobe,
             verbose=args.verbose,
             quality_index=args.quality,
             target_resolution=args.resolution,
@@ -673,15 +790,19 @@ def main() -> None:
             task_log_file=args.task_log,
             skip_completed=skip_completed,
             continue_task_log=args.continue_task,
+            continue_group=args.group,
             export_report=args.export_report,
             report_format=args.report_format,
             start_sec=start_sec,
-            end_sec=end_sec
+            end_sec=end_sec,
+            custom_headers=custom_headers,
+            group=args.group,
+            verify=args.verify
         )
     else:
         if args.list_qualities:
             proxies = parse_proxy(args.proxy)
-            tmp_parser = M3U8Parser(url, proxies=proxies)
+            tmp_parser = M3U8Parser(url, proxies=proxies, headers=custom_headers)
             entries = tmp_parser.get_master_entries()
             if entries:
                 print(format_quality_table(entries))
@@ -699,6 +820,7 @@ def main() -> None:
             resume=resume,
             keep_temp=args.keep_temp,
             ffmpeg_path=args.ffmpeg,
+            ffprobe_path=args.ffprobe,
             verbose=args.verbose,
             quality_index=args.quality,
             target_resolution=args.resolution,
@@ -706,7 +828,9 @@ def main() -> None:
             list_qualities_only=False,
             task_recorder=None,
             start_sec=start_sec,
-            end_sec=end_sec
+            end_sec=end_sec,
+            custom_headers=custom_headers,
+            verify=args.verify
         )
         if ok:
             print(f"\n✓ 任务完成: {msg}")

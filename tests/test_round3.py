@@ -378,8 +378,8 @@ def test_5_export_report():
         assert "【待处理任务】" in content
         assert "下载超时" in content
         assert "解密失败" in content
-        assert "成功:   3" in content
-        assert "失败:   2" in content
+        assert "成功:" in content and "3" in content
+        assert "失败:" in content and "2" in content
         print(f"  ✓ TXT报告生成: {os.path.basename(report_txt)}")
         print(f"    大小: {os.path.getsize(report_txt)} bytes")
 

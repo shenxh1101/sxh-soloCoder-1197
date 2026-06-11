@@ -1,6 +1,7 @@
 import os
 import re
 import tempfile
+from http.cookiejar import MozillaCookieJar
 from urllib.parse import urljoin, urlparse
 
 
@@ -72,3 +73,80 @@ def get_ts_filename(index):
 
 def get_decrypted_ts_filename(index):
     return f"segment_{index:05d}_dec.ts"
+
+
+def load_cookies_from_file(cookie_file: str) -> dict:
+    cookies = {}
+    if not cookie_file or not os.path.exists(cookie_file):
+        return cookies
+    try:
+        jar = MozillaCookieJar(cookie_file)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        for cookie in jar:
+            cookies[cookie.name] = cookie.value
+    except Exception:
+        try:
+            with open(cookie_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split('\t')
+                    if len(parts) >= 7:
+                        cookies[parts[5]] = parts[6]
+                    elif '=' in line:
+                        name, _, value = line.partition('=')
+                        cookies[name.strip()] = value.strip()
+        except Exception:
+            pass
+    return cookies
+
+
+def cookies_to_header(cookies: dict) -> str:
+    if not cookies:
+        return ""
+    return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+def parse_header_string(header_str: str) -> dict:
+    headers = {}
+    if not header_str:
+        return headers
+    for part in header_str.split(','):
+        part = part.strip()
+        if ':' not in part:
+            continue
+        name, _, value = part.partition(':')
+        name = name.strip()
+        value = value.strip()
+        if name and value:
+            headers[name] = value
+    return headers
+
+
+def build_headers(custom_headers: dict = None, cookies: dict = None,
+                   user_agent: str = None) -> dict:
+    headers = {
+        "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    if custom_headers:
+        headers.update(custom_headers)
+    if cookies:
+        cookie_header = cookies_to_header(cookies)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+    return headers
+
+
+def classify_http_error(status_code: int, url: str = "") -> str:
+    if status_code in (401, 403):
+        return "auth"
+    if status_code in (404, 410):
+        return "not_found"
+    if status_code == 429:
+        return "rate_limit"
+    if 400 <= status_code < 500:
+        return "client_error"
+    if 500 <= status_code < 600:
+        return "server_error"
+    return "unknown"

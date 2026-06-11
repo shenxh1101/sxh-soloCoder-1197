@@ -13,7 +13,8 @@ from .utils import (
     get_decrypted_ts_filename,
     format_size,
     format_speed,
-    format_time
+    format_time,
+    classify_http_error
 )
 
 
@@ -90,6 +91,7 @@ class DownloadProgress:
         with self._lock:
             self.completed_segments += 1
             self.downloaded_bytes += size_bytes
+            self.in_progress_bytes = max(0, self.in_progress_bytes - size_bytes)
             if self.completed_segments > 0:
                 self.estimated_bytes_per_segment = (
                     self.downloaded_bytes / self.completed_segments
@@ -108,6 +110,10 @@ class DownloadProgress:
                 self.current_speed = bytes_diff / elapsed if elapsed > 0 else 0
                 self.last_bytes = self.downloaded_bytes
                 self.last_update_time = now
+            elif self.downloaded_bytes > 0 and self.current_speed == 0:
+                total_elapsed = now - self.start_time
+                if total_elapsed > 0.3:
+                    self.current_speed = self.downloaded_bytes / total_elapsed
 
     @property
     def total_display_bytes(self) -> int:
@@ -259,6 +265,13 @@ class M3U8Downloader:
             )
             response.raise_for_status()
             return response.content
+        except requests.exceptions.HTTPError as e:
+            resp = getattr(e, 'response', None)
+            status_code = getattr(resp, 'status_code', 0) if resp else 0
+            err_type = classify_http_error(status_code)
+            if err_type == "auth":
+                print(f"  获取密钥鉴权失败 (HTTP {status_code}): {key_url}")
+            return None
         except Exception:
             return None
 
@@ -315,6 +328,33 @@ class M3U8Downloader:
                 total_progress_reported += attempt_bytes
                 return True, attempt_bytes, ""
 
+            except requests.exceptions.HTTPError as e:
+                resp = getattr(e, 'response', None)
+                status_code = getattr(resp, 'status_code', 0) if resp else 0
+                err_type = classify_http_error(status_code)
+                if err_type == "auth":
+                    last_error = f"鉴权失败 (HTTP {status_code}): 需要 Cookie 或登录态"
+                elif err_type == "not_found":
+                    last_error = f"资源不存在 (HTTP {status_code})"
+                elif err_type == "rate_limit":
+                    last_error = f"请求频率限制 (HTTP {status_code})"
+                elif err_type == "server_error":
+                    last_error = f"服务器错误 (HTTP {status_code})"
+                else:
+                    last_error = str(e)
+                if attempt_bytes > 0 and self._progress:
+                    self._progress.remove_in_progress(attempt_bytes)
+                total_progress_reported = max(0, total_progress_reported - attempt_bytes)
+                if os.path.exists(temp_filepath):
+                    try:
+                        os.remove(temp_filepath)
+                    except:
+                        pass
+                if err_type == "auth":
+                    return False, 0, last_error
+                if attempt < self.retries - 1:
+                    backoff = min(2 ** attempt, 10)
+                    time.sleep(backoff)
             except Exception as e:
                 last_error = str(e)
                 if attempt_bytes > 0 and self._progress:
@@ -405,9 +445,8 @@ class M3U8Downloader:
                 try:
                     ok, size, note = future.result()
                     if ok:
-                        if note == "already_downloaded":
-                            if self._progress:
-                                self._progress.add_completed(size)
+                        if self._progress:
+                            self._progress.add_completed(size)
                         self.result.success_segments.add(segment.index)
                         self.result.total_bytes += size
                     else:

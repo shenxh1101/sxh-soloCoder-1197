@@ -1,18 +1,32 @@
 import os
 import subprocess
+import json as json_module
 import shutil
-from typing import List, Optional
+from typing import List, Optional, Dict
 import tempfile
 
 
 class FFmpegMerger:
-    def __init__(self, ffmpeg_path: str = "ffmpeg"):
+    def __init__(self, ffmpeg_path: str = "ffmpeg", ffprobe_path: str = "ffprobe"):
         self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
 
     def check_ffmpeg(self) -> bool:
         try:
             result = subprocess.run(
                 [self.ffmpeg_path, "-version"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def check_ffprobe(self) -> bool:
+        try:
+            result = subprocess.run(
+                [self.ffprobe_path, "-version"],
                 capture_output=True,
                 text=True,
                 timeout=10
@@ -136,6 +150,86 @@ class FFmpegMerger:
         except Exception as e:
             print(f"格式转换失败: {e}")
             return False
+
+
+def probe_file(ffprobe_path: str, file_path: str) -> Optional[Dict]:
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                file_path
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0 and result.stdout:
+            return json_module.loads(result.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def verify_output(
+    output_file: str,
+    expected_segments: int,
+    expected_duration: float,
+    ffprobe_path: str = "ffprobe",
+    min_file_size: int = 1024
+) -> dict:
+    from .task_recorder import VerificationResult
+
+    result = VerificationResult()
+    detail_parts = []
+
+    if not os.path.exists(output_file):
+        result.file_size_ok = False
+        result.ffprobe_ok = False
+        result.details = "输出文件不存在"
+        return {"ok": False, "verification": result}
+
+    file_size = os.path.getsize(output_file)
+    if file_size < min_file_size:
+        result.file_size_ok = False
+        detail_parts.append(f"文件过小({file_size}B<{min_file_size}B)")
+
+    probe_data = probe_file(ffprobe_path, output_file)
+
+    if probe_data is None:
+        result.ffprobe_ok = False
+        detail_parts.append("ffprobe 无法探测文件")
+    else:
+        fmt = probe_data.get("format", {})
+        streams = probe_data.get("streams", [])
+
+        has_video = any(s.get("codec_type") == "video" for s in streams)
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+
+        if not has_video and not has_audio:
+            result.ffprobe_ok = False
+            detail_parts.append("未检测到视频或音频流")
+
+        if fmt:
+            probed_duration = float(fmt.get("duration", 0))
+            if expected_duration > 0 and probed_duration > 0:
+                ratio = probed_duration / expected_duration
+                if ratio < 0.5 or ratio > 1.5:
+                    result.duration_ok = False
+                    detail_parts.append(
+                        f"时长偏差大: 探测{probed_duration:.1f}s "
+                        f"vs 期望{expected_duration:.1f}s "
+                        f"(比例{ratio:.2f})"
+                    )
+        else:
+            result.ffprobe_ok = False
+            detail_parts.append("ffprobe 无 format 信息")
+
+    result.details = "; ".join(detail_parts) if detail_parts else "全部通过"
+    return {"ok": result.all_ok, "verification": result}
 
 
 def cleanup_temp_dir(temp_dir: str) -> bool:
